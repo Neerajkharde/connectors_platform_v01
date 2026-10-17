@@ -1,0 +1,38 @@
+﻿SAP Base URL : https://sandbox.api.sap.com/s4hanacloud
+API Key      : jkWfTV...tcbi
+Running 7 endpoint probes...
+
+
+------------------------------------------------------------
+  TEST: Supplier list ($top=3)
+  URL : https://sandbox.api.sap.com/s4hanacloud/sap/opu/odata/sap/API_BUSINESS_PARTNER/A_Supplier?$top=3
+  STATUS: 500
+  RESPONSE HEADERS: {'Date': 'Sat, 17 Oct 2026 06:54:23 GMT', 'Content-Type': 'application/json', 'Content-Length': '183', 'Connection': 'keep-alive'}
+  ERROR BODY:
+{"fault":{"faultstring":"Rate limit quota violation. Quota limit  exceeded. Identifier : jkWfTVBXZn8zPGoG28QryvNGCggZtcbi","detail":{"errorcode":"policies.ratelimit.QuotaViolation"}}}
+------------------------------------------------------------
+
+------------------------------------------------------------
+python : Traceback (most recent call last):
+At line:1 char:1
++ python diag_test.py 2>&1 | Out-File -FilePath 
+diag_output.txt -Encodi ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (mo 
+   st recent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "V:\sap-postgres-connector\diag_test.py", line 97, 
+in <module>
+    probe(desc, path, accept)
+  File "V:\sap-postgres-connector\diag_test.py", line 75, 
+in probe
+    print(f"  TEST: {desc}")
+  File "C:\Users\neera\AppData\Local\Programs\Python\Python
+312\Lib\encodings\cp1252.py", line 19, in encode
+    return 
+codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character 
+'\u2192' in position 27: character maps to <undefined>
