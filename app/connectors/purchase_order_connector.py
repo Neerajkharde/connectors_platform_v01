@@ -1,8 +1,17 @@
 """
 Purchase order connector — fetches PO headers and their line items
 from the SAP Purchase Order API (OData V4 / JSON).
+
+Call-count strategy
+-------------------
+Instead of one request per supplier and one per PO, the keys are combined
+into OR-filters (``Supplier eq 'a' or Supplier eq 'b' ...``) of
+``chunk_size`` keys per request, and every request is paged.
 """
 
+import requests
+
+from app.odata import chunked, iter_v4_rows, or_filter
 from app.sap_client import SAPClient
 
 PO_BASE = (
@@ -15,61 +24,58 @@ PO_ITEM_PATH = f"{PO_BASE}/PurchaseOrderItem"
 
 def fetch_purchase_orders(
     client: SAPClient,
-    supplier_id: str,
+    supplier_ids: list[str],
     top: int = 5000,
+    page_size: int = 100,
+    chunk_size: int = 20,
 ) -> list[dict]:
-    """Fetch PO headers for a given supplier (OData V4 JSON)."""
-    params = {
-        "$top": str(top),
-        "$filter": f"Supplier eq '{supplier_id}'",
-    }
-    data = client.get_json(PO_PATH, params=params)
-    return data.get("value", [])
+    """Fetch PO headers for a group of suppliers (OData V4 JSON)."""
+    orders: list[dict] = []
+    for chunk in chunked(sorted(set(supplier_ids)), chunk_size):
+        if len(orders) >= top:
+            break
+        params = {"$filter": or_filter("Supplier", chunk)}
+        try:
+            orders.extend(
+                iter_v4_rows(client, PO_PATH, params, page_size, top - len(orders))
+            )
+        except requests.HTTPError as exc:
+            print(f"  [WARN] Could not fetch POs for suppliers {chunk[0]}..{chunk[-1]}: {exc}")
+    return orders
 
 
 def fetch_purchase_order_items(
     client: SAPClient,
-    purchase_order: str,
-    top: int = 5000,
+    purchase_orders: list[str],
+    top: int = 20000,
+    page_size: int = 100,
+    chunk_size: int = 20,
 ) -> list[dict]:
-    """Fetch line items for a specific purchase order.
-
-    Tries the dedicated PurchaseOrderItem entity set with a filter
-    on PurchaseOrder.
-    """
-    params = {
-        "$top": str(top),
-        "$filter": f"PurchaseOrder eq '{purchase_order}'",
-    }
-    data = client.get_json(PO_ITEM_PATH, params=params)
-    return data.get("value", [])
+    """Fetch line items for a group of purchase orders."""
+    items: list[dict] = []
+    for chunk in chunked(sorted(set(purchase_orders)), chunk_size):
+        if len(items) >= top:
+            break
+        params = {"$filter": or_filter("PurchaseOrder", chunk)}
+        try:
+            items.extend(
+                iter_v4_rows(client, PO_ITEM_PATH, params, page_size, top - len(items))
+            )
+        except requests.HTTPError as exc:
+            print(f"  [WARN] Could not fetch items for POs {chunk[0]}..{chunk[-1]}: {exc}")
+    return items
 
 
 def fetch_all_pos_with_items(
     client: SAPClient,
     supplier_ids: list[str],
     top: int = 5000,
+    item_top: int = 20000,
+    page_size: int = 100,
+    chunk_size: int = 20,
 ) -> dict:
     """Return {'orders': [...], 'items': [...]} for all given suppliers."""
-    orders: list[dict] = []
-    items: list[dict] = []
-
-    for sid in supplier_ids:
-        try:
-            pos = fetch_purchase_orders(client, sid, top)
-        except Exception as exc:
-            print(f"  [WARN] Could not fetch POs for supplier {sid}: {exc}")
-            continue
-
-        orders.extend(pos)
-        for po in pos:
-            po_num = po.get("PurchaseOrder", "")
-            if not po_num:
-                continue
-            try:
-                po_items = fetch_purchase_order_items(client, po_num, top)
-                items.extend(po_items)
-            except Exception as exc:
-                print(f"  [WARN] Could not fetch items for PO {po_num}: {exc}")
-
+    orders = fetch_purchase_orders(client, supplier_ids, top, page_size, chunk_size)
+    po_numbers = [po["PurchaseOrder"] for po in orders if po.get("PurchaseOrder")]
+    items = fetch_purchase_order_items(client, po_numbers, item_top, page_size, chunk_size)
     return {"orders": orders, "items": items}

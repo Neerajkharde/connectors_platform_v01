@@ -176,5 +176,48 @@ class TestInvoicePORefMapper(unittest.TestCase):
         self.assertEqual(ref.document_currency, "USD")
 
 
+class TestFixedMappings(unittest.TestCase):
+    """Regression tests for bugs found in review of the original mappers."""
+
+    def test_supplier_text_uses_longtextid_as_key(self):
+        # SAP's real key field is LongTextID; the old mapper read 'TextType' and stored ''
+        # for every row, so a supplier's 2nd text silently collided with the 1st.
+        a = map_supplier_text("1018", {"Language": "EN", "LongTextID": "0001", "LongText": "a"})
+        b = map_supplier_text("1018", {"Language": "EN", "LongTextID": "0002", "LongText": "b"})
+        self.assertEqual((a.text_type, b.text_type), ("0001", "0002"))
+
+    def test_timestamp_with_7_fraction_digits_and_tz(self):
+        self.assertEqual(_timestamp("2026-09-26T13:19:33.1234567Z"), datetime(2026, 9, 26, 13, 19, 33, 123456))
+        self.assertEqual(_timestamp("2026-09-26T15:19:33+02:00"), datetime(2026, 9, 26, 13, 19, 33))
+        self.assertIsNone(_timestamp("not a date"))
+
+    def test_deletion_codes(self):
+        base = {"PurchaseOrder": "1"}
+        self.assertIs(map_purchase_order({**base, "PurchaseOrderDeletionCode": "L"}).deletion_indicator, True)
+        self.assertIs(map_purchase_order({**base, "PurchaseOrderDeletionCode": ""}).deletion_indicator, False)
+        self.assertIsNone(map_purchase_order(base).deletion_indicator)
+        item = {"PurchaseOrder": "1", "PurchaseOrderItem": "10"}
+        self.assertIs(map_purchase_order_item({**item, "PurchaseOrderItemDeletionCode": "L"}).deletion_indicator, True)
+
+    def test_item_numbers_are_normalised_so_foreign_keys_match(self):
+        item = map_purchase_order_item({"PurchaseOrder": "1", "PurchaseOrderItem": "00010"})
+        ref = map_invoice_po_reference({"SupplierInvoice": "5", "FiscalYear": "2026", "PurchaseOrder": "1",
+                                        "PurchaseOrderItem": "10", "SupplierInvoiceItem": "000001"})
+        self.assertEqual(item.purchase_order_item, ref.purchase_order_item)
+        self.assertEqual(ref.supplier_invoice_item, "1")
+
+    def test_invoice_cancelled_from_reverse_document(self):
+        base = {"SupplierInvoice": "5", "FiscalYear": "2026"}
+        self.assertIs(map_supplier_invoice({**base, "ReverseDocument": "5100000099"}).invoice_is_cancelled, True)
+        self.assertIs(map_supplier_invoice({**base, "ReverseDocument": ""}).invoice_is_cancelled, False)
+        self.assertIsNone(map_supplier_invoice(base).invoice_is_cancelled)
+
+    def test_false_values_are_not_lost_by_or_fallbacks(self):
+        # old code: _bool(a or b) skipped a legitimate False
+        po = map_supplier_invoice({"SupplierInvoice": "5", "FiscalYear": "2026", "InvoiceIsCancelled": False,
+                                   "ReverseDocument": "X"})
+        self.assertIs(po.invoice_is_cancelled, False)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,7 +8,8 @@ Each mapper handles:
   • Preserving leading zeros in string identifiers
 """
 
-from datetime import date, datetime
+import re
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
@@ -65,18 +66,26 @@ def _date(value: Any) -> Optional[date]:
 
 
 def _timestamp(value: Any) -> Optional[datetime]:
-    """Parse timestamps from SAP ISO-8601 strings."""
+    """Parse SAP ISO-8601 timestamps into a *naive UTC* datetime.
+
+    Handles the 'Z' suffix and OData's 7-digit fractional seconds
+    ('2026-09-26T13:19:33.1234567Z'), which older Python versions reject.
+    Timezone-aware values are converted to UTC and made naive so they fit the
+    ``TIMESTAMP`` (without time zone) columns predictably.
+    """
     if value is None:
         return None
     s = str(value).strip()
     if not s:
         return None
+    s = re.sub(r"(\.\d{6})\d+", r"\1", s.replace("Z", "+00:00"))
     try:
-        # Handle 'Z' suffix
-        s = s.replace("Z", "+00:00")
-        return datetime.fromisoformat(s)
+        ts = datetime.fromisoformat(s)
     except ValueError:
         return None
+    if ts.tzinfo is not None:
+        ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+    return ts
 
 
 def _decimal(value: Any) -> Optional[Decimal]:
@@ -87,6 +96,56 @@ def _decimal(value: Any) -> Optional[Decimal]:
         return Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
+
+
+def _deletion_flag(value: Any) -> Optional[bool]:
+    """SAP *deletion codes* are letters, not booleans: '' = active, 'L' = deleted.
+
+    ``_bool('L')`` would return None and lose the information, so deletion
+    code fields use this converter.  Real booleans / 'true' / 'X' still work.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    return s in ("l", "true", "1", "x")
+
+
+def _deletion_from(props: dict, *keys: str) -> Optional[bool]:
+    """Deletion flag from the first present field among ``keys``.
+
+    A field that is present but empty means "not deleted" (False); only when
+    none of the fields exist at all is the result None (unknown).
+    """
+    if not any(k in props for k in keys):
+        return None
+    return bool(_deletion_flag(_first(props, *keys)))
+
+
+def _first(props: dict, *keys: str) -> Any:
+    """First value among ``keys`` that is present and not an empty string.
+
+    Unlike ``a or b`` this keeps legitimate ``False`` / ``0`` values.
+    """
+    for key in keys:
+        value = props.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _item_no(value: Any) -> Optional[str]:
+    """Normalise item numbers: '00010' and '10' both become '10'.
+
+    The PO item (OData V4) and the invoice reference (OData V2) come from
+    different services; normalising both sides guarantees that the
+    ``invoice_po_reference -> purchase_order_item`` foreign key matches.
+    """
+    s = _str(value)
+    if s is None:
+        return None
+    return s.lstrip("0") or "0"
 
 
 # ------------------------------------------------------------------
@@ -144,8 +203,8 @@ def map_supplier_text(supplier_id: str, props: dict) -> SupplierText:
     return SupplierText(
         supplier=supplier_id,
         language=props.get("Language", ""),
-        text_type=props.get("TextType", ""),
-        text=_str(props.get("LongText") or props.get("Text")),
+        text_type=_str(_first(props, "LongTextID", "TextType")) or "",
+        text=_str(_first(props, "LongText", "Text")),
         deletion_indicator=_bool(props.get("DeletionIndicator")),
         created_by_user=_str(props.get("CreatedByUser")),
         creation_date=_date(props.get("CreationDate")),
@@ -175,7 +234,9 @@ def map_purchase_order(props: dict) -> PurchaseOrder:
         company_code=_str(props.get("CompanyCode")),
         purchasing_organization=_str(props.get("PurchasingOrganization")),
         document_currency=_str(props.get("DocumentCurrency")),
-        deletion_indicator=_bool(props.get("PurchaseOrderDeletionCode")),
+        deletion_indicator=_deletion_from(
+            props, "PurchaseOrderDeletionCode", "PurchasingDocumentDeletionCode"
+        ),
         purchase_order_is_blocked=_bool(props.get("PurchaseOrderIsBlocked")),
         invoices_is_blocked=_bool(props.get("InvoicesIsBlocked")),
         goods_receipt_is_blocked=_bool(props.get("GoodsReceiptIsBlocked")),
@@ -186,7 +247,7 @@ def map_purchase_order(props: dict) -> PurchaseOrder:
 def map_purchase_order_item(props: dict) -> PurchaseOrderItem:
     return PurchaseOrderItem(
         purchase_order=props["PurchaseOrder"],
-        purchase_order_item=props["PurchaseOrderItem"],
+        purchase_order_item=_item_no(props["PurchaseOrderItem"]) or "",
         material=_str(props.get("Material")),
         short_text=_str(props.get("PurchaseOrderItemText") or props.get("ShortText")),
         order_quantity=_decimal(props.get("OrderQuantity")),
@@ -204,7 +265,9 @@ def map_purchase_order_item(props: dict) -> PurchaseOrderItem:
             props.get("PurchasingDocumentItemCategory")
             or props.get("ItemCategory")
         ),
-        deletion_indicator=_bool(props.get("PurchaseOrderItemDeletionCode") or props.get("DeletionIndicator")),
+        deletion_indicator=_deletion_from(
+            props, "PurchaseOrderItemDeletionCode", "PurchasingDocumentDeletionCode", "DeletionIndicator"
+        ),
         goods_receipt_is_expected=_bool(props.get("GoodsReceiptIsExpected")),
         invoices_expected=_bool(props.get("InvoiceIsExpected") or props.get("InvoicesExpected")),
         plant=_str(props.get("Plant")),
@@ -223,6 +286,16 @@ def map_purchase_order_item(props: dict) -> PurchaseOrderItem:
 # Invoice mappers  (OData V2 – XML properties dict)
 # ------------------------------------------------------------------
 
+def _invoice_cancelled(props: dict) -> Optional[bool]:
+    """An invoice is cancelled when a reversal document exists."""
+    explicit = _first(props, "InvoiceIsCancelled", "IsInvoiceCancelled")
+    if explicit is not None:
+        return _bool(explicit)
+    if "ReverseDocument" in props:
+        return bool(_str(props.get("ReverseDocument")))
+    return None
+
+
 def map_supplier_invoice(props: dict) -> SupplierInvoice:
     return SupplierInvoice(
         supplier_invoice=props["SupplierInvoice"],
@@ -235,8 +308,8 @@ def map_supplier_invoice(props: dict) -> SupplierInvoice:
         invoicing_party=_str(props.get("InvoicingParty")),
         document_currency=_str(props.get("DocumentCurrency")),
         invoice_gross_amount=_decimal(props.get("InvoiceGrossAmount")),
-        invoice_is_cancelled=_bool(props.get("InvoiceIsCancelled") or props.get("IsInvoiceCancelled")),
-        overall_invoice_status=_str(props.get("OverallInvoiceStatus") or props.get("SupplierInvoiceStatus")),
+        invoice_is_cancelled=_invoice_cancelled(props),
+        overall_invoice_status=_str(_first(props, "OverallInvoiceStatus", "SupplierInvoiceStatus")),
         created_by_user=_str(props.get("CreatedByUser")),
         creation_date=_date(props.get("CreationDate")),
         last_change_date_time=_timestamp(props.get("LastChangeDateTime")),
@@ -248,8 +321,8 @@ def map_invoice_po_reference(props: dict) -> InvoicePOReference:
         supplier_invoice=props["SupplierInvoice"],
         fiscal_year=props["FiscalYear"],
         purchase_order=props["PurchaseOrder"],
-        purchase_order_item=props["PurchaseOrderItem"],
-        supplier_invoice_item=props["SupplierInvoiceItem"],
+        purchase_order_item=_item_no(props["PurchaseOrderItem"]) or "",
+        supplier_invoice_item=_item_no(props["SupplierInvoiceItem"]) or "",
         referenced_amount=_decimal(props.get("SupplierInvoiceItemAmount")),
         referenced_quantity=_decimal(props.get("QuantityInPurchaseOrderUnit")),
         document_currency=_str(props.get("DocumentCurrency")),

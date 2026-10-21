@@ -68,7 +68,7 @@ CREATE TABLE supplier_text (
     supplier                VARCHAR(10)   NOT NULL,
     language                VARCHAR(2)    NOT NULL,
     text_type               VARCHAR(4)    NOT NULL,
-    text                    VARCHAR(255),
+    text                    TEXT,   -- SAP long texts exceed 255 chars (VARCHAR(255) crashed the load)
     deletion_indicator      BOOLEAN,
     created_by_user         VARCHAR(12),
     creation_date           DATE,

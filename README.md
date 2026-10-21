@@ -58,7 +58,7 @@ Copy `.env.example` to `.env` and fill in your values:
 cp .env.example .env
 ```
 
-Edit `.env`:
+Edit `.env` (all options are documented in `.env.example`):
 
 ```env
 # SAP connection
@@ -75,8 +75,13 @@ PG_PASSWORD=your-password
 ```
 
 **Auth modes:**
-- `apikey` — sends `APIKey: <key>` header (for SAP API Business Hub sandbox)
+- `apikey` — sends `APIKey: <key>` header (**required** for the SAP API Business Hub sandbox)
 - `basic` — sends HTTP Basic Auth (for on-premise / BTP systems)
+- `none` — no authentication
+
+**Request behaviour** (`SAP_PAGE_SIZE`, `SAP_FILTER_CHUNK`, `SAP_USE_EXPAND`,
+`SAP_REQUEST_DELAY`, `SAP_MAX_RETRIES`, `SAP_TIMEOUT`) is explained in `.env.example`.
+`SUPPLIER_TOP`, `PO_TOP`, `ITEM_TOP`, `INVOICE_TOP` are *overall* record limits per run.
 
 ## Execution
 
@@ -88,12 +93,16 @@ python -m app.main
 
 The script will:
 1. Connect to SAP and PostgreSQL
-2. Fetch all suppliers and their related company / purchasing-org / text records
-3. Fetch purchase orders and line items for each supplier
-4. Fetch invoice headers and invoice-to-PO references for each PO
+2. Fetch suppliers with their company / purchasing-org / text records (`$expand`, paged)
+3. Fetch purchase orders and line items (grouped `$filter`, paged)
+4. Fetch invoice-to-PO references and the invoice headers they point to (grouped, paged)
 5. Map SAP fields to PostgreSQL columns
-6. Insert records in FK-dependency order inside a single transaction
-7. Print record counts and run relationship-verification queries
+6. Check referential integrity (repairs / drops rows that would violate a foreign key and reports them)
+7. Insert records in FK-dependency order inside a single transaction — only after *all* SAP data was fetched
+8. Print record counts and run relationship-verification queries
+
+The number of SAP calls is printed at the end of the fetch phase (roughly `suppliers / page_size`
+plus a handful per entity type, instead of thousands).
 
 ## Project Structure
 
@@ -102,7 +111,9 @@ sap-postgres-connector/
 ├── app/
 │   ├── __init__.py
 │   ├── config.py                 # Environment / .env loader
-│   ├── sap_client.py             # SAP HTTP client (OData V2 XML + V4 JSON)
+│   ├── sap_client.py             # SAP HTTP client: throttle, retry, quota fail-fast
+│   ├── odata.py                  # OData parsing, paging, $filter chunking helpers
+│   ├── integrity.py              # FK-consistency check between mapping and insert
 │   ├── db.py                     # PostgreSQL connection factory
 │   ├── models.py                 # Python dataclasses for all 8 tables
 │   ├── main.py                   # Orchestrator / CLI entry point
@@ -118,6 +129,7 @@ sap-postgres-connector/
 │   └── schema.sql                # PostgreSQL DDL (all 8 tables)
 ├── tests/
 │   └── test_mappers.py           # Unit tests for mapping functions
+├── diag_test.py                  # endpoint diagnostic (1 call per probe)
 ├── .env.example
 ├── .gitignore
 ├── requirements.txt
@@ -186,12 +198,48 @@ LIMIT 10;
 | A_SupplierInvoice | OData V2 | XML/Atom | Fetched by composite key (invoice + fiscal year) |
 | A_SuplrInvcItemPurOrdRef | OData V2 | XML/Atom | Filtered by PurchaseOrder |
 
+## Troubleshooting
+
+### `policies.ratelimit.QuotaViolation` (HTTP 500)
+
+```json
+{"fault":{"faultstring":"Rate limit quota violation. Quota limit  exceeded...","detail":{"errorcode":"policies.ratelimit.QuotaViolation"}}}
+```
+
+The SAP API Business Hub gateway allows each API key only a limited number of calls and answers
+with this error when it is used up (note: it uses HTTP **500**, not 429). This is a **server-side
+limit — no code change can restore the quota**; you have to wait until it resets or use another key.
+
+What the connector does about it:
+- makes far fewer calls (grouped filters, `$expand`, paging) so a run fits in the quota;
+- throttles calls (`SAP_REQUEST_DELAY`) and retries *temporary* errors (spike arrest, 503) with back-off;
+- on a real quota error it **stops immediately** (exit code 2), sends no further requests and writes nothing to PostgreSQL;
+- `python diag_test.py` checks every endpoint with one call each and stops at the first quota error.
+
+### `UnicodeEncodeError: 'charmap' codec can't encode ...` (Windows)
+Happened when output was redirected (`> file`, `| Out-File`) and the script printed a non-ASCII
+character. The scripts now force UTF-8 output and use ASCII markers.
+
+### Upgrading an existing database
+`supplier_text.text` changed from `VARCHAR(255)` to `TEXT` (SAP long texts are longer and made the
+whole load fail). Either re-run `sql/schema.sql` (drops and recreates all tables) or keep your data with:
+
+```sql
+ALTER TABLE supplier_text ALTER COLUMN text TYPE TEXT;
+```
+
+## Tests
+
+```bash
+python -m pytest tests
+```
+
 **Known gap:** Invoice header fields (e.g. `InvoiceGrossAmount`, `PostingDate`) are fetched from `A_SupplierInvoice`. If this resource is not available in your SAP system, invoice headers will be skipped and the gap reported.
 
 ## Out of Scope (v1)
 
 - Incremental sync / change detection
-- Retry policies / exponential backoff
+- Resumable runs / checkpointing (retry + back-off for temporary errors IS implemented)
 - Staging tables
 - Monitoring / notifications
 - Scheduling / orchestration
