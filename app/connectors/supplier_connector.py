@@ -20,6 +20,7 @@ from app.odata import (
     inline_nav_properties,
     iter_v2_entries,
     parse_feed,
+    keyset_filter,
     watermark_filter,
 )
 from app.sap_client import SAPClient, SAPQuotaExceeded
@@ -128,6 +129,7 @@ def fetch_all_suppliers_with_related(
     date_field: str = "CreationDate",
     date_type: str = "date",
     ordered: bool = False,
+    watermark_key: str | None = None,
 ) -> dict:
     """Return a dict with keys 'suppliers', 'companies', 'purch_orgs', 'texts'.
 
@@ -136,7 +138,9 @@ def fetch_all_suppliers_with_related(
 
     Incremental mode
     ----------------
-    * ``watermark`` given -> only suppliers with ``date_field >= watermark``.
+    * ``watermark`` given -> only suppliers with ``date_field >= watermark``;
+      with ``watermark_key`` too, only suppliers strictly *after* the row
+      ``(watermark, watermark_key)`` (so ties on the date cannot stall paging).
     * ``ordered=True`` or a watermark -> ``$orderby date_field asc, Supplier asc``.
 
     Oldest-first matters: if ``top`` cuts the list short, the highest value
@@ -152,7 +156,8 @@ def fetch_all_suppliers_with_related(
     if watermark is not None or ordered:
         extra = {"$orderby": f"{date_field} asc, Supplier asc"}
         if watermark is not None:
-            extra["$filter"] = watermark_filter(date_field, date_type, watermark, odata_version=2)
+            extra["$filter"] = keyset_filter(date_field, date_type, watermark, 2,
+                                             "Supplier", watermark_key)
         try:
             return _fetch(client, top, page_size, use_expand, extra)
         except requests.HTTPError as exc:

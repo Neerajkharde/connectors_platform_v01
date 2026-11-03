@@ -4,6 +4,10 @@
 -- =============================================================
 
 -- Drop tables in reverse dependency order (if re-creating)
+-- The incremental cursors describe what is IN these tables, so they go too
+-- (run_log / change_log are history and are kept).
+DROP TABLE IF EXISTS supplier_po_cursor CASCADE;
+DROP TABLE IF EXISTS sync_state CASCADE;
 DROP TABLE IF EXISTS invoice_po_reference CASCADE;
 DROP TABLE IF EXISTS supplier_invoice CASCADE;
 DROP TABLE IF EXISTS purchase_order_item CASCADE;

@@ -183,23 +183,39 @@ def and_filter(*parts: str | None) -> str:
     return " and ".join(f"({p})" for p in parts)
 
 
+def _literal(kind: str, value, odata_version: int) -> str:
+    """OData literal for a (naive-UTC) datetime / date, keeping microseconds."""
+    frac = f".{value.microsecond:06d}" if value.microsecond else ""
+    if kind == "date":
+        day = value.strftime("%Y-%m-%d")
+        return f"datetime'{day}T00:00:00'" if odata_version == 2 else day
+    if kind == "datetime" and odata_version == 2:
+        return f"datetime'{value.strftime('%Y-%m-%dT%H:%M:%S')}{frac}'"
+    iso = f"{value.strftime('%Y-%m-%dT%H:%M:%S')}{frac}Z"  # datetimeoffset (and V4 "datetime")
+    return f"datetimeoffset'{iso}'" if odata_version == 2 else iso
+
+
 def watermark_filter(field: str, kind: str, value, odata_version: int) -> str:
     """``<field> ge <literal>`` for a watermark ``value`` (naive-UTC datetime).
 
-    ``ge`` (not ``gt``) is deliberate: several records can share the exact
-    watermark value, and ``gt`` would skip those that were cut off by ``$top``.
-    The few boundary rows that are re-downloaded are harmless because the
-    upsert ignores rows that did not change.
+    ``ge`` re-downloads the few boundary rows; harmless because the upsert
+    ignores unchanged rows.  Use :func:`keyset_filter` when the last key is known.
 
     kind: "date" | "datetime" | "datetimeoffset".
     odata_version: 2 (Atom/XML literals) or 4 (JSON, bare ISO literals).
     """
-    if kind == "date":
-        day = value.strftime("%Y-%m-%d")
-        literal = f"datetime'{day}T00:00:00'" if odata_version == 2 else day
-    elif kind == "datetime" and odata_version == 2:
-        literal = f"datetime'{value.strftime('%Y-%m-%dT%H:%M:%S')}'"
-    else:  # datetimeoffset (and "datetime" on V4, which only knows offsets)
-        iso = value.strftime("%Y-%m-%dT%H:%M:%SZ")
-        literal = f"datetimeoffset'{iso}'" if odata_version == 2 else iso
-    return f"{field} ge {literal}"
+    return f"{field} ge {_literal(kind, value, odata_version)}"
+
+
+def keyset_filter(field: str, kind: str, value, odata_version: int,
+                  key_field: str, key: str | None) -> str:
+    """Rows strictly *after* the cursor ``(value, key)`` in ``(field, key_field)`` order.
+
+    ``(F gt V) or (F eq V and K gt 'key')``.  Unlike ``ge`` this skips the rows
+    already loaded even when thousands of rows share the same timestamp, so
+    paging always moves forward.  Without a key it falls back to ``ge``.
+    """
+    if key is None:
+        return watermark_filter(field, kind, value, odata_version)
+    lit = _literal(kind, value, odata_version)
+    return f"({field} gt {lit}) or ({field} eq {lit} and {key_field} gt {quote(key)})"

@@ -24,6 +24,9 @@ the old behaviour (always fetch from the start).
 """
 
 import sys
+from datetime import datetime, timedelta, timezone
+
+import requests
 
 # On Windows, stdout is cp1252 when redirected (``> file`` / ``| Out-File``) and
 # crashes on any non-cp1252 character.  Force UTF-8 and never fail on printing.
@@ -38,10 +41,13 @@ from app.sap_client import SAPClient, SAPQuotaExceeded
 from app.db import get_connection
 from app.integrity import enforce_integrity, MAX_EXAMPLES
 from app import sync_state
-from app.sync_state import ENTITY_SUPPLIER, ENTITY_PO
+from app.sync_state import ENTITY_SUPPLIER
+from app.odata import chunked
 
 from app.connectors.supplier_connector import fetch_all_suppliers_with_related
-from app.connectors.purchase_order_connector import fetch_all_pos_with_items
+from app.connectors.purchase_order_connector import (
+    fetch_all_pos_with_items, fetch_po_batch, fetch_purchase_order_items,
+)
 from app.connectors.invoice_connector import fetch_all_invoices_and_refs
 
 from app.mapping.mappers import (
@@ -112,8 +118,8 @@ def _map_raw(raw: dict) -> dict:
 class _Run:
     """State shared by the stages of one run (stats / dropped rows for run_log)."""
 
-    def __init__(self, conn, cur, sap, run_id: str):
-        self.conn, self.cur, self.sap, self.run_id = conn, cur, sap, run_id
+    def __init__(self, conn, cur, sap, run_id: str, sc):
+        self.conn, self.cur, self.sap, self.run_id, self.sc = conn, cur, sap, run_id, sc
         self.stats: dict[str, dict[str, int]] = {}
         self.dropped: dict[str, dict] = {}
 
@@ -149,6 +155,148 @@ class _Run:
         self.conn.commit()
 
 
+class _PoFilterUnsupported(Exception):
+    """SAP rejected the PO date filter/ordering -> fall back to a plain full fetch."""
+
+
+def _po_stage_resumable(ctx: "_Run") -> dict:
+    """Stage 2+3 in resumable batches (incremental mode).
+
+    One batch = next POs of a supplier group -> their items -> their invoice
+    references/headers -> map/integrity/upsert -> advance the PO cursor of those
+    suppliers -> COMMIT.  A quota error loses only the batch in flight; the
+    cursors of finished batches are saved, so the next run continues from them.
+
+    Per-supplier cursors (table ``supplier_po_cursor``) are what make this
+    resumable.  Suppliers sharing the same cursor are fetched together (chunks of
+    ``SAP_FILTER_CHUNK`` suppliers in one OR-filter).  ``PO_TOP`` is the budget
+    of POs per *run*; the run simply stops there and the next one carries on.
+    """
+    sc, cur, sap, run_id = ctx.sc, ctx.cur, ctx.sap, ctx.run_id
+    suppliers = sorted(sync_state.load_known_keys(cur)["suppliers"])
+    cursors = {} if sc.full_refresh else sync_state.load_po_cursors(cur)
+
+    groups: dict = {}
+    for sid in suppliers:
+        groups.setdefault(cursors.get(sid), []).append(sid)
+    # never-synced suppliers first, then by cursor (oldest first)
+    ordered = sorted(groups.items(),
+                     key=lambda kv: (0,) if kv[0] is None else (1, kv[0][0], kv[0][1] or ""))
+    chunks = [(cur_, chunk) for cur_, members in ordered for chunk in chunked(members, sc.filter_chunk)]
+    never = len(groups.get(None, []))
+    print(f"  {len(suppliers)} suppliers in the database ({never} never synced for POs), "
+          f"{len(chunks)} supplier chunk(s)")
+    print(f"  Budget this run: up to {sc.po_top} POs, in batches of {sc.po_batch}")
+
+    remaining, batches, total_pos, next_chunk = sc.po_top, 0, 0, 0
+    for idx, (cursor, chunk) in enumerate(chunks):
+        next_chunk = idx
+        while remaining > 0:
+            want = min(sc.po_batch, remaining)
+            t_fetch = datetime.now(timezone.utc).replace(tzinfo=None)
+            try:
+                rows = fetch_po_batch(sap, chunk, cursor, want, sc.page_size,
+                                      sc.po_date_field, sc.po_date_type)
+            except requests.HTTPError as exc:
+                if batches == 0:
+                    raise _PoFilterUnsupported(str(exc))
+                print(f"  [WARN] PO request failed ({exc}); stopping the PO stage here. "
+                      f"Finished batches are saved - the next run continues.")
+                return {"pos": total_pos, "batches": batches, "pending": True}
+            numbers = [r["PurchaseOrder"] for r in rows if r.get("PurchaseOrder")]
+            items = (fetch_purchase_order_items(sap, numbers, sc.item_top, sc.page_size, sc.filter_chunk)
+                     if numbers else [])
+            if len(items) >= sc.item_top:
+                print(f"  [WARN] ITEM_TOP ({sc.item_top}) reached in this batch - some items may be "
+                      f"missing. Raise ITEM_TOP or lower PO_BATCH.")
+            inv = (fetch_all_invoices_and_refs(sap, numbers, top=sc.invoice_top,
+                                               page_size=sc.page_size, chunk_size=sc.filter_chunk)
+                   if numbers else {"invoice_headers": [], "po_refs": []})
+
+            # everything for this batch is fetched -> now save it atomically
+            exhausted = len(rows) < want
+            new_cursor = sync_state.max_cursor(rows, sc.po_date_field, "PurchaseOrder")
+            if exhausted:
+                # all POs after the cursor are loaded; future changes carry a newer
+                # timestamp.  1 day margin covers clock differences with SAP.
+                margin = t_fetch - timedelta(days=1)
+                if new_cursor is None or new_cursor[0] < margin:
+                    new_cursor = (margin, None)
+            print(f"\n  Batch {batches + 1}: {len(rows)} POs, {len(items)} items, "
+                  f"{len(inv['invoice_headers'])} invoice headers, {len(inv['po_refs'])} references "
+                  f"(SAP calls so far: {sap.request_count})")
+            raw = {"orders": rows, "items": items,
+                   "invoice_headers": inv["invoice_headers"], "po_refs": inv["po_refs"]}
+            ctx.save_stage("po-batch", raw, STAGE_ORDERS + STAGE_INVOICES)
+            if new_cursor is not None:
+                sync_state.set_po_cursors(cur, chunk, new_cursor[0], new_cursor[1], run_id)
+            ctx.checkpoint()                                   # COMMIT = checkpoint
+            batches += 1
+            total_pos += len(rows)
+            remaining -= len(rows)
+            cursor = new_cursor or cursor
+            if exhausted:
+                break
+        if remaining <= 0:
+            next_chunk = idx + 1
+            break
+        next_chunk = idx + 1
+
+    pending = sum(len(c) for _, c in chunks[next_chunk:])
+    return {"pos": total_pos, "batches": batches, "pending": pending}
+
+
+def _po_stage_legacy(ctx: "_Run", supplier_ids: list) -> list:
+    """Stage 2 without cursors: fetch POs + items from the start (capped by PO_TOP).
+
+    Used for INCREMENTAL=false and when SAP rejects the date filter.
+    Returns the PO numbers fetched (for the invoice stage).
+    """
+    sc, sap = ctx.sc, ctx.sap
+    raw_po: dict = {"orders": [], "items": []}
+    try:
+        raw_po = fetch_all_pos_with_items(
+            sap, supplier_ids, top=sc.po_top, item_top=sc.item_top,
+            page_size=sc.page_size, chunk_size=sc.filter_chunk,
+        )
+    except SAPQuotaExceeded as exc:
+        partial = getattr(exc, "partial", None) or {}
+        if partial.get("orders"):
+            print(f"  [QUOTA] saving the {len(partial['orders'])} purchase orders fetched so far ...")
+            ctx.save_stage("orders", partial, STAGE_ORDERS)
+            ctx.checkpoint()
+        raise
+    print(f"  Fetched {len(raw_po['orders'])} purchase orders, {len(raw_po['items'])} items")
+    print(f"  (SAP calls so far: {sap.request_count})")
+    ctx.save_stage("orders", raw_po, STAGE_ORDERS)
+    ctx.checkpoint()
+    print("  OK Stage 2 committed")
+    return sorted({po["PurchaseOrder"] for po in raw_po["orders"] if po.get("PurchaseOrder")})
+
+
+def _invoice_stage_legacy(ctx: "_Run", po_numbers: list) -> None:
+    """Stage 3 for a list of PO numbers (used after the legacy PO stage)."""
+    sc, sap = ctx.sc, ctx.sap
+    print(f"  Looking up invoice references for {len(po_numbers)} purchase orders")
+    try:
+        raw_inv = fetch_all_invoices_and_refs(
+            sap, po_numbers, top=sc.invoice_top, page_size=sc.page_size, chunk_size=sc.filter_chunk,
+        )
+    except SAPQuotaExceeded as exc:
+        partial = getattr(exc, "partial", None)
+        if partial and partial.get("invoice_headers"):
+            print(f"  [QUOTA] saving the {len(partial['invoice_headers'])} invoice headers fetched so far ...")
+            ctx.save_stage("invoices", partial, STAGE_INVOICES)
+            ctx.checkpoint()
+        raise
+    print(f"  Fetched {len(raw_inv['invoice_headers'])} invoice headers, "
+          f"{len(raw_inv['po_refs'])} invoice-PO references")
+    print(f"  Total SAP calls for this run: {sap.request_count}")
+    ctx.save_stage("invoices", raw_inv, STAGE_INVOICES)
+    ctx.checkpoint()
+    print("  OK Stage 3 committed")
+
+
 def run() -> None:
     # ------------------------------------------------------------------
     # Step 1 - Load configuration
@@ -177,6 +325,10 @@ def run() -> None:
     print("  OK PostgreSQL connection established")
 
     sync_state.ensure_schema(conn)          # sync_state / run_log / change_log + triggers
+    stale = sync_state.reset_stale_cursors(conn)
+    if stale:
+        print(f"  [WARN] The data tables are empty but {' and '.join(stale)} existed - "
+              f"reset, so everything is fetched again from the start.")
     run_id = sync_state.new_run_id()
     sync_state.start_run(conn, run_id, mode)  # also tags the session for the change-log trigger
     print(f"  OK Run id: {run_id}")
@@ -184,29 +336,31 @@ def run() -> None:
     status, error = "OK", None
     try:
         cur = conn.cursor()
-        ctx = _Run(conn, cur, sap, run_id)
+        ctx = _Run(conn, cur, sap, run_id, sc)
 
         # ==================================================================
         # STAGE 1 - suppliers
         # ==================================================================
         _print_header("Stage 1 - Suppliers")
-        known_before = sync_state.load_known_keys(cur)
-        sup_wm = sync_state.get_watermark(cur, ENTITY_SUPPLIER) if use_wm else None
-        print(f"  Watermark ({sc.supplier_date_field}): {sup_wm or 'none - fetching from the oldest'}")
+        sup_cur = sync_state.get_cursor(cur, ENTITY_SUPPLIER) if use_wm else None
+        sup_wm, sup_key = sup_cur if sup_cur else (None, None)
+        print(f"  Watermark ({sc.supplier_date_field}): "
+              f"{(str(sup_wm) + (' / ' + sup_key if sup_key else '')) if sup_wm else 'none - fetching from the oldest'}")
 
         def _advance_supplier_wm(raw: dict) -> None:
-            """Watermark = highest date fetched; only valid for oldest-first data."""
+            """Cursor = last (date, Supplier) fetched; only valid for oldest-first data."""
             if not sc.incremental or not raw.get("_ordered"):
                 return
-            new_wm = sync_state.max_field_value(raw["suppliers"], sc.supplier_date_field)
-            if new_wm is not None:
-                sync_state.set_watermark(cur, ENTITY_SUPPLIER, sc.supplier_date_field, new_wm, run_id)
-                print(f"  Supplier watermark -> {new_wm}")
+            new_cur = sync_state.max_cursor(raw["suppliers"], sc.supplier_date_field, "Supplier")
+            if new_cur is not None:
+                sync_state.set_cursor(cur, ENTITY_SUPPLIER, sc.supplier_date_field,
+                                      new_cur[0], new_cur[1], run_id)
+                print(f"  Supplier watermark -> {new_cur[0]} / {new_cur[1]}")
 
         try:
             raw_sup = fetch_all_suppliers_with_related(
                 sap, top=sc.supplier_top, page_size=sc.page_size, use_expand=sc.use_expand,
-                watermark=sup_wm, date_field=sc.supplier_date_field,
+                watermark=sup_wm, watermark_key=sup_key, date_field=sc.supplier_date_field,
                 date_type=sc.supplier_date_type, ordered=sc.incremental,
             )
         except SAPQuotaExceeded as exc:
@@ -227,108 +381,32 @@ def run() -> None:
         print("  OK Stage 1 committed")
 
         # ==================================================================
-        # STAGE 2 - purchase orders + items
+        # STAGE 2 (+3) - purchase orders, items, invoices
         # ==================================================================
-        _print_header("Stage 2 - Purchase orders & items")
-        all_suppliers = sorted(sync_state.load_known_keys(cur)["suppliers"])
-        if sc.incremental:
-            # every stored supplier, not only the ones fetched in this run
-            fresh = sorted({s["Supplier"] for s in raw_sup["suppliers"] if s.get("Supplier")}
-                           - known_before["suppliers"])
-        else:
-            all_suppliers = sorted({s["Supplier"] for s in raw_sup["suppliers"] if s.get("Supplier")})
-            fresh = []
-        po_wm = sync_state.get_watermark(cur, ENTITY_PO) if use_wm else None
-        print(f"  Watermark ({sc.po_date_field}): {po_wm or 'none - fetching all POs'}")
-
-        # Groups: suppliers first seen in this run get ALL their POs (their old
-        # POs lie behind the watermark); the other suppliers only POs >= watermark.
-        fresh_set = set(fresh)
-        old_suppliers = [x for x in all_suppliers if x not in fresh_set]
-        if po_wm is None or not fresh:
-            groups = [(all_suppliers, po_wm)]
-        else:
-            groups = [(fresh, None), (old_suppliers, po_wm)]
-            print(f"  {len(fresh)} new suppliers -> all of their POs; "
-                  f"{len(old_suppliers)} known suppliers -> POs changed since the watermark")
-
-        raw_po: dict = {"orders": [], "items": []}
-        wm_orders: list[dict] = []     # orders of the watermarked group (basis of the new watermark)
-        po_complete = True
-        fresh_complete = True
-
-        def _po_group(ids, wm):
-            return fetch_all_pos_with_items(
-                sap, ids, top=sc.po_top, item_top=sc.item_top,
-                page_size=sc.page_size, chunk_size=sc.filter_chunk,
-                watermark=wm, date_field=sc.po_date_field, date_type=sc.po_date_type,
-            )
-
-        try:
-            for ids, wm in groups:
-                if not ids:
-                    continue
-                part = _po_group(ids, wm)
-                raw_po["orders"] += part["orders"]
-                raw_po["items"] += part["items"]
-                if wm is not None or len(groups) == 1:
-                    wm_orders = part["orders"]
-                    po_complete = po_complete and part.get("complete", True)
-                else:
-                    fresh_complete = part.get("complete", True)
-        except SAPQuotaExceeded as exc:
-            partial = getattr(exc, "partial", None) or {}
-            n_orders = len(raw_po["orders"]) + len(partial.get("orders", []))
-            if n_orders:
-                print(f"  [QUOTA] saving the {n_orders} purchase orders fetched so far ...")
-                raw_po["orders"] += partial.get("orders", [])
-                raw_po["items"] += partial.get("items", [])
-                ctx.save_stage("orders", raw_po, STAGE_ORDERS)
-                ctx.checkpoint()          # watermark NOT advanced: stage is incomplete
-            raise
-
-        print(f"  Fetched {len(raw_po['orders'])} purchase orders, {len(raw_po['items'])} items")
-        print(f"  (SAP calls so far: {sap.request_count})")
-        ctx.save_stage("orders", raw_po, STAGE_ORDERS)
+        stored_suppliers = sorted(sync_state.load_known_keys(cur)["suppliers"])
+        fetched_suppliers = sorted({s["Supplier"] for s in raw_sup["suppliers"] if s.get("Supplier")})
+        run_legacy = not sc.incremental
+        legacy_suppliers = fetched_suppliers
 
         if sc.incremental:
-            if not fresh_complete:
-                print("  [WARN] PO_TOP cut off the POs of newly loaded suppliers - some of their older POs "
-                      "are missing. Raise PO_TOP, or run once with FULL_REFRESH=true.")
-            new_po_wm = sync_state.max_field_value(wm_orders, sc.po_date_field)
-            if not po_complete:
-                print("  [WARN] PO_TOP was reached - PO watermark NOT advanced (it would skip POs). "
-                      "Raise PO_TOP so one run can finish.")
-            elif new_po_wm is not None:
-                sync_state.set_watermark(cur, ENTITY_PO, sc.po_date_field, new_po_wm, run_id)
-                print(f"  PO watermark -> {new_po_wm}")
-        ctx.checkpoint()
-        print("  OK Stage 2 committed")
+            _print_header("Stage 2 - Purchase orders, items & invoices (resumable batches)")
+            try:
+                summary = _po_stage_resumable(ctx)
+                print(f"\n  OK {summary['pos']} POs in {summary['batches']} committed batch(es)")
+                if summary["pending"]:
+                    print(f"  [INFO] PO_TOP reached - {summary['pending']} supplier(s) still to be "
+                          f"scanned. Nothing is lost: the next run continues from the saved cursors.")
+            except _PoFilterUnsupported as exc:
+                print(f"  [WARN] SAP rejected the PO date filter/ordering on '{sc.po_date_field}' ({exc}); "
+                      f"falling back to a plain full fetch (no incremental saving for POs).")
+                run_legacy, legacy_suppliers = True, stored_suppliers
 
-        # ==================================================================
-        # STAGE 3 - invoices + PO references
-        # ==================================================================
-        _print_header("Stage 3 - Invoices & PO references")
-        po_numbers = sorted({po["PurchaseOrder"] for po in raw_po["orders"] if po.get("PurchaseOrder")})
-        print(f"  Looking up invoice references for {len(po_numbers)} purchase orders of this run")
-        try:
-            raw_inv = fetch_all_invoices_and_refs(
-                sap, po_numbers, top=sc.invoice_top,
-                page_size=sc.page_size, chunk_size=sc.filter_chunk,
-            )
-        except SAPQuotaExceeded as exc:
-            partial = getattr(exc, "partial", None)
-            if partial and partial.get("invoice_headers"):
-                print(f"  [QUOTA] saving the {len(partial['invoice_headers'])} invoice headers fetched so far ...")
-                ctx.save_stage("invoices", partial, STAGE_INVOICES)
-                ctx.checkpoint()
-            raise
-        print(f"  Fetched {len(raw_inv['invoice_headers'])} invoice headers, "
-              f"{len(raw_inv['po_refs'])} invoice-PO references")
+        if run_legacy:
+            _print_header("Stage 2 - Purchase orders & items")
+            po_numbers = _po_stage_legacy(ctx, legacy_suppliers)
+            _print_header("Stage 3 - Invoices & PO references")
+            _invoice_stage_legacy(ctx, po_numbers)
         print(f"  Total SAP calls for this run: {sap.request_count}")
-        ctx.save_stage("invoices", raw_inv, STAGE_INVOICES)
-        ctx.checkpoint()
-        print("  OK Stage 3 committed")
 
         # ------------------------------------------------------------------
         # Verification

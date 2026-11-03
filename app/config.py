@@ -26,6 +26,7 @@ class SAPConfig:
     max_retries: int = 3    # retries for temporary errors (spike arrest, 503...)
     timeout: float = 60.0   # seconds before a SAP call is abandoned
     # --- incremental sync -------------------------------------------------
+    po_batch: int = 500          # POs per batch: PO -> items -> invoices -> commit (checkpoint)
     incremental: bool = True     # use watermarks so a re-run only fetches new/changed rows
     full_refresh: bool = False   # ignore watermarks for this run (re-download everything)
     # SAP field + literal type used for the watermark filter per entity.
@@ -76,6 +77,7 @@ def load_config() -> AppConfig:
         request_delay=float(os.getenv("SAP_REQUEST_DELAY", "0.25")),
         max_retries=int(os.getenv("SAP_MAX_RETRIES", "3")),
         timeout=float(os.getenv("SAP_TIMEOUT", "60")),
+        po_batch=int(os.getenv("PO_BATCH", "500")),
         incremental=_env_bool("INCREMENTAL", True),
         full_refresh=_env_bool("FULL_REFRESH", False),
         supplier_date_field=os.getenv("SUPPLIER_DATE_FIELD", "CreationDate").strip(),

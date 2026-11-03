@@ -20,6 +20,22 @@ CREATE TABLE IF NOT EXISTS sync_state (
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- keyset cursor: (last_value, last_key) = "everything up to and including this row is loaded"
+ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS last_key TEXT;
+
+-- -------------------------------------------------------------
+-- 1b. SUPPLIER_PO_CURSOR - how far the POs of each supplier are loaded
+--     (lets the PO stage stop and resume at any batch)
+--     No FK on purpose: bookkeeping must never block a load.
+-- -------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS supplier_po_cursor (
+    supplier     TEXT        PRIMARY KEY,
+    last_value   TIMESTAMP   NOT NULL,          -- naive UTC, PO date field
+    last_key     TEXT,                          -- last PurchaseOrder at that value (NULL = date only)
+    last_run_id  UUID,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- -------------------------------------------------------------
 -- 2. RUN_LOG - what each run did
 -- -------------------------------------------------------------

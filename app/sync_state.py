@@ -35,6 +35,31 @@ def ensure_schema(conn) -> None:
     conn.commit()
 
 
+def reset_stale_cursors(conn) -> list[str]:
+    """Forget cursors that claim data which is no longer in the tables.
+
+    Cursors say "everything up to here is loaded".  If someone truncated or
+    re-created the data tables, that claim is false and the missing rows would
+    never be fetched again.  Returns what was reset (for a log message).
+    """
+    reset = []
+    with conn.cursor() as cur:
+        cur.execute("SELECT NOT EXISTS (SELECT 1 FROM supplier)")
+        no_suppliers = cur.fetchone()[0]
+        cur.execute("SELECT NOT EXISTS (SELECT 1 FROM purchase_order)")
+        no_orders = cur.fetchone()[0]
+        if no_suppliers:
+            cur.execute("DELETE FROM sync_state")
+            if cur.rowcount:
+                reset.append("supplier watermark")
+        if no_suppliers or no_orders:
+            cur.execute("DELETE FROM supplier_po_cursor")
+            if cur.rowcount:
+                reset.append("PO cursors")
+    conn.commit()
+    return reset
+
+
 # ------------------------------------------------------------------
 # Watermarks
 # ------------------------------------------------------------------
@@ -58,6 +83,71 @@ def set_watermark(cur, entity: str, field: str, value: datetime, run_id: str) ->
                updated_at      = now()
         """,
         (entity, field, value, run_id),
+    )
+
+
+Cursor = tuple  # (datetime, key | None)
+
+
+def get_cursor(cur, entity: str) -> Optional[Cursor]:
+    """``(value, key)`` of an entity, or None if never synced (key may be None)."""
+    cur.execute("SELECT last_value, last_key FROM sync_state WHERE entity = %s", (entity,))
+    row = cur.fetchone()
+    return (row[0], row[1]) if row and row[0] is not None else None
+
+
+def set_cursor(cur, entity: str, field: str, value: datetime, key: Optional[str], run_id: str) -> None:
+    """Store ``(value, key)``; a cursor only ever moves forward."""
+    cur.execute(
+        """
+        INSERT INTO sync_state (entity, watermark_field, last_value, last_key, last_run_id, updated_at)
+        VALUES (%s, %s, %s, %s, %s, now())
+        ON CONFLICT (entity) DO UPDATE
+           SET watermark_field = EXCLUDED.watermark_field,
+               last_value = EXCLUDED.last_value, last_key = EXCLUDED.last_key,
+               last_run_id = EXCLUDED.last_run_id, updated_at = now()
+         WHERE sync_state.last_value IS NULL
+            OR (EXCLUDED.last_value, COALESCE(EXCLUDED.last_key, ''))
+             > (sync_state.last_value, COALESCE(sync_state.last_key, ''))
+        """,
+        (entity, field, value, key, run_id),
+    )
+
+
+def max_cursor(rows: Iterable[dict], field: str, key_field: str) -> Optional[Cursor]:
+    """Highest ``(field value, key)`` over raw SAP rows - the last row in (field, key) order."""
+    best = None
+    for row in rows:
+        ts = parse_sap_timestamp(row.get(field))
+        if ts is None:
+            continue
+        cand = (ts, row.get(key_field) or "")
+        if best is None or cand > best:
+            best = cand
+    return (best[0], best[1] or None) if best else None
+
+
+def load_po_cursors(cur) -> dict:
+    """supplier -> (value, key) for every supplier whose POs were loaded before."""
+    cur.execute("SELECT supplier, last_value, last_key FROM supplier_po_cursor")
+    return {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+
+
+def set_po_cursors(cur, suppliers: list, value: datetime, key: Optional[str], run_id: str) -> None:
+    """Move the PO cursor of all ``suppliers`` forward to ``(value, key)``."""
+    if not suppliers:
+        return
+    cur.execute(
+        """
+        INSERT INTO supplier_po_cursor (supplier, last_value, last_key, last_run_id, updated_at)
+        SELECT s, %s, %s, %s, now() FROM unnest(%s::text[]) AS s
+        ON CONFLICT (supplier) DO UPDATE
+           SET last_value = EXCLUDED.last_value, last_key = EXCLUDED.last_key,
+               last_run_id = EXCLUDED.last_run_id, updated_at = now()
+         WHERE (EXCLUDED.last_value, COALESCE(EXCLUDED.last_key, ''))
+             > (supplier_po_cursor.last_value, COALESCE(supplier_po_cursor.last_key, ''))
+        """,
+        (value, key, run_id, list(suppliers)),
     )
 
 

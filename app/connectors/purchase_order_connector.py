@@ -13,7 +13,7 @@ from datetime import datetime
 
 import requests
 
-from app.odata import and_filter, chunked, iter_v4_rows, or_filter, watermark_filter
+from app.odata import and_filter, chunked, iter_v4_rows, keyset_filter, or_filter, watermark_filter
 from app.sap_client import SAPClient, SAPQuotaExceeded
 
 PO_BASE = (
@@ -88,6 +88,34 @@ def fetch_purchase_orders(
             stats["complete"] = complete
             stats["filter_dropped"] = filter_dropped
     return orders
+
+
+def fetch_po_batch(
+    client: SAPClient,
+    supplier_ids: list[str],
+    cursor: tuple | None,
+    batch: int,
+    page_size: int = 100,
+    date_field: str = "LastChangeDateTime",
+    date_type: str = "datetimeoffset",
+) -> list[dict]:
+    """The next ``batch`` POs of ``supplier_ids`` after ``cursor`` (resumable paging).
+
+    Rows come back oldest first in ``(date_field, PurchaseOrder)`` order and
+    only those strictly after ``cursor = (value, key)`` (or from the very start
+    when ``cursor`` is None).  Because the order is total, the last row returned
+    is a safe cursor for *all* the given suppliers - even if thousands of POs
+    share one timestamp.
+
+    ``requests.HTTPError`` is NOT caught: it usually means SAP does not support
+    the date field in $filter/$orderby, and the caller falls back.
+    """
+    flt = or_filter("Supplier", supplier_ids)
+    if cursor is not None:
+        value, key = cursor
+        flt = and_filter(flt, keyset_filter(date_field, date_type, value, 4, "PurchaseOrder", key))
+    params = {"$filter": flt, "$orderby": f"{date_field} asc, PurchaseOrder asc"}
+    return list(iter_v4_rows(client, PO_PATH, params, page_size, batch))
 
 
 def fetch_purchase_order_items(
