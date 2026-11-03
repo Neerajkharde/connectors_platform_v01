@@ -165,3 +165,41 @@ def chunked(items: Iterable, size: int) -> Iterator[list]:
 def or_filter(field: str, values: Iterable[str]) -> str:
     """``Field eq 'a' or Field eq 'b' ...`` – one request for many keys."""
     return " or ".join(f"{field} eq {quote(v)}" for v in values)
+
+
+# ------------------------------------------------------------------
+# Watermark ($filter on a date field) helpers - used for incremental sync
+# ------------------------------------------------------------------
+
+def and_filter(*parts: str | None) -> str:
+    """AND the non-empty filter parts together, parenthesising each one.
+
+    Needed because ``or_filter`` output must be grouped before it is combined
+    with a date condition: ``(A or B) and Date ge ...``.
+    """
+    parts = [p for p in parts if p]
+    if len(parts) <= 1:
+        return parts[0] if parts else ""
+    return " and ".join(f"({p})" for p in parts)
+
+
+def watermark_filter(field: str, kind: str, value, odata_version: int) -> str:
+    """``<field> ge <literal>`` for a watermark ``value`` (naive-UTC datetime).
+
+    ``ge`` (not ``gt``) is deliberate: several records can share the exact
+    watermark value, and ``gt`` would skip those that were cut off by ``$top``.
+    The few boundary rows that are re-downloaded are harmless because the
+    upsert ignores rows that did not change.
+
+    kind: "date" | "datetime" | "datetimeoffset".
+    odata_version: 2 (Atom/XML literals) or 4 (JSON, bare ISO literals).
+    """
+    if kind == "date":
+        day = value.strftime("%Y-%m-%d")
+        literal = f"datetime'{day}T00:00:00'" if odata_version == 2 else day
+    elif kind == "datetime" and odata_version == 2:
+        literal = f"datetime'{value.strftime('%Y-%m-%dT%H:%M:%S')}'"
+    else:  # datetimeoffset (and "datetime" on V4, which only knows offsets)
+        iso = value.strftime("%Y-%m-%dT%H:%M:%SZ")
+        literal = f"datetimeoffset'{iso}'" if odata_version == 2 else iso
+    return f"{field} ge {literal}"

@@ -11,6 +11,8 @@ Now the three sub-collections are delivered *inside* the supplier pages via
 ``$expand`` the connector falls back to the per-supplier navigation calls.
 """
 
+from datetime import datetime
+
 import requests
 
 from app.odata import (
@@ -18,8 +20,9 @@ from app.odata import (
     inline_nav_properties,
     iter_v2_entries,
     parse_feed,
+    watermark_filter,
 )
-from app.sap_client import SAPClient
+from app.sap_client import SAPClient, SAPQuotaExceeded
 
 SUPPLIER_PATH = "/sap/opu/odata/sap/API_BUSINESS_PARTNER/A_Supplier"
 
@@ -40,51 +43,80 @@ def fetch_supplier_related(client: SAPClient, supplier_id: str, nav_name: str) -
     return parse_feed(client.get_xml(path))
 
 
-def _fetch_with_expand(client: SAPClient, top: int, page_size: int) -> dict:
-    result: dict = {"suppliers": [], **{v: [] for v in NAV_TARGETS.values()}}
+def _fetch_with_expand(client: SAPClient, top: int, page_size: int, extra: dict) -> dict:
+    result: dict = {"suppliers": [], **{v: [] for v in NAV_TARGETS.values()},
+                    "_ordered": "$orderby" in extra}
 
-    params = {"$expand": ",".join(NAV_TARGETS)} # Important: the server must support these navigation properties and $expand for this to work.
+    params = {"$expand": ",".join(NAV_TARGETS), **extra}  # the server must support $expand for this to work
 
-    for entry in iter_v2_entries(client, SUPPLIER_PATH, params, page_size, top):
-        props = entry_properties(entry)
-        sid = props.get("Supplier", "")
-        if not sid:
-            continue
+    try:
+        for entry in iter_v2_entries(client, SUPPLIER_PATH, params, page_size, top):
+            props = entry_properties(entry)
+            sid = props.get("Supplier", "")
+            if not sid:
+                continue
 
-        result["suppliers"].append(props)
-        
-        for nav, key in NAV_TARGETS.items():
-            rows = inline_nav_properties(entry, nav)
-            if rows is None:  # server ignored $expand for this entry
+            # Collect the children first and add supplier + children together,
+            # so a quota error never leaves a supplier with half its children.
+            children: dict[str, list] = {}
+            for nav, key in NAV_TARGETS.items():
+                rows = inline_nav_properties(entry, nav)
+                if rows is None:  # server ignored $expand for this entry
+                    try:
+                        rows = fetch_supplier_related(client, sid, nav)
+                    except requests.HTTPError as exc:
+                        print(f"  [WARN] Could not fetch {nav} for supplier {sid}: {exc}")
+                        rows = []
+                for row in rows:
+                    row.setdefault("Supplier", sid)  # child rows always know their parent
+                children[key] = rows
+            result["suppliers"].append(props)
+            for key, rows in children.items():
+                result[key].extend(rows)
+    except SAPQuotaExceeded as exc:
+        exc.partial = result  # everything fetched before the quota ran out
+        raise
+    return result
+
+
+def _fetch_per_supplier(client: SAPClient, top: int, page_size: int, extra: dict) -> dict:
+    result: dict = {"suppliers": [], **{v: [] for v in NAV_TARGETS.values()},
+                    "_ordered": "$orderby" in extra}
+    try:
+        for entry in iter_v2_entries(client, SUPPLIER_PATH, extra or None, page_size, top):
+            props = entry_properties(entry)
+            sid = props.get("Supplier", "")
+            if not sid:
+                continue
+            children: dict[str, list] = {}
+            for nav, key in NAV_TARGETS.items():
                 try:
                     rows = fetch_supplier_related(client, sid, nav)
                 except requests.HTTPError as exc:
                     print(f"  [WARN] Could not fetch {nav} for supplier {sid}: {exc}")
-                    rows = []
-            for row in rows:
-                row.setdefault("Supplier", sid)  # child rows always know their parent
-                result[key].append(row)
+                    continue
+                for row in rows:
+                    row.setdefault("Supplier", sid)
+                children[key] = rows
+            result["suppliers"].append(props)
+            for key, rows in children.items():
+                result[key].extend(rows)
+    except SAPQuotaExceeded as exc:
+        exc.partial = result
+        raise
     return result
 
 
-def _fetch_per_supplier(client: SAPClient, top: int, page_size: int) -> dict:
-    result: dict = {"suppliers": [], **{v: [] for v in NAV_TARGETS.values()}}
-    for entry in iter_v2_entries(client, SUPPLIER_PATH, None, page_size, top):
-        props = entry_properties(entry)
-        sid = props.get("Supplier", "")
-        if not sid:
-            continue
-        result["suppliers"].append(props)
-        for nav, key in NAV_TARGETS.items():
-            try:
-                rows = fetch_supplier_related(client, sid, nav)
-            except requests.HTTPError as exc:
-                print(f"  [WARN] Could not fetch {nav} for supplier {sid}: {exc}")
-                continue
-            for row in rows:
-                row.setdefault("Supplier", sid)
-                result[key].append(row)
-    return result
+def _fetch(client: SAPClient, top: int, page_size: int, use_expand: bool, extra: dict) -> dict:
+    if use_expand:
+        try:
+            return _fetch_with_expand(client, top, page_size, extra)
+        except requests.HTTPError as exc:
+            if extra:
+                raise  # probably the date filter, not $expand - the caller drops the filter
+            print(f"  [WARN] $expand request failed ({exc}); "
+                  f"falling back to one call per supplier (slow, uses more quota).")
+    return _fetch_per_supplier(client, top, page_size, extra)
 
 
 def fetch_all_suppliers_with_related(
@@ -92,16 +124,38 @@ def fetch_all_suppliers_with_related(
     top: int = 800,
     page_size: int = 50,
     use_expand: bool = True,
+    watermark: datetime | None = None,
+    date_field: str = "CreationDate",
+    date_type: str = "date",
+    ordered: bool = False,
 ) -> dict:
     """Return a dict with keys 'suppliers', 'companies', 'purch_orgs', 'texts'.
 
-    Each value is a list of raw property dicts ready to be mapped.
-    ``SAPQuotaExceeded`` is deliberately NOT caught here - it must stop the run.
+    Each value is a list of raw property dicts ready to be mapped.  The extra
+    key ``'_ordered'`` says whether the rows came back oldest-first (see below).
+
+    Incremental mode
+    ----------------
+    * ``watermark`` given -> only suppliers with ``date_field >= watermark``.
+    * ``ordered=True`` or a watermark -> ``$orderby date_field asc, Supplier asc``.
+
+    Oldest-first matters: if ``top`` cuts the list short, the highest value
+    that *was* fetched is a safe new watermark and the next run continues
+    where this one stopped.  ``Supplier`` is the tie-breaker so ``$skip`` paging
+    is stable when many suppliers share the same date.  If SAP rejects the
+    filter or the ordering, a warning is printed and everything is fetched
+    unordered instead (``'_ordered'`` is then False and no watermark is kept).
+
+    ``SAPQuotaExceeded`` is deliberately NOT caught here - it must stop the run
+    (the partial result fetched so far is attached as ``exc.partial``).
     """
-    if use_expand:
+    if watermark is not None or ordered:
+        extra = {"$orderby": f"{date_field} asc, Supplier asc"}
+        if watermark is not None:
+            extra["$filter"] = watermark_filter(date_field, date_type, watermark, odata_version=2)
         try:
-            return _fetch_with_expand(client, top, page_size)
+            return _fetch(client, top, page_size, use_expand, extra)
         except requests.HTTPError as exc:
-            print(f"  [WARN] $expand request failed ({exc}); "
-                  f"falling back to one call per supplier (slow, uses more quota).")
-    return _fetch_per_supplier(client, top, page_size)
+            print(f"  [WARN] SAP rejected the supplier date filter/ordering on '{date_field}' ({exc}); "
+                  f"falling back to a plain full fetch (no incremental saving for suppliers).")
+    return _fetch(client, top, page_size, use_expand, {})

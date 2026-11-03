@@ -115,6 +115,7 @@ sap-postgres-connector/
 │   ├── odata.py                  # OData parsing, paging, $filter chunking helpers
 │   ├── integrity.py              # FK-consistency check between mapping and insert
 │   ├── db.py                     # PostgreSQL connection factory
+│   ├── sync_state.py             # watermarks, run log, run-id tagging, known keys
 │   ├── models.py                 # Python dataclasses for all 8 tables
 │   ├── main.py                   # Orchestrator / CLI entry point
 │   ├── connectors/
@@ -124,11 +125,14 @@ sap-postgres-connector/
 │   ├── mapping/
 │   │   └── mappers.py            # SAP field → PostgreSQL column mappers
 │   └── repositories/
-│       └── repositories.py       # INSERT logic for all 8 tables
+│       └── repositories.py       # upsert logic (insert / update-if-changed) for all 8 tables
 ├── sql/
-│   └── schema.sql                # PostgreSQL DDL (all 8 tables)
+│   ├── schema.sql                # PostgreSQL DDL (all 8 tables)
+│   └── incremental.sql           # sync_state, run_log, change_log + change-logging triggers
 ├── tests/
-│   └── test_mappers.py           # Unit tests for mapping functions
+│   ├── test_mappers.py           # Unit tests for mapping functions
+│   ├── test_incremental_units.py # watermark filters, connectors, integrity (no DB)
+│   └── test_incremental_e2e.py   # full run vs. fake SAP + real PostgreSQL
 ├── diag_test.py                  # endpoint diagnostic (1 call per probe)
 ├── .env.example
 ├── .gitignore
@@ -231,15 +235,70 @@ ALTER TABLE supplier_text ALTER COLUMN text TYPE TEXT;
 ## Tests
 
 ```bash
-python -m pytest tests
+python -m unittest discover -s tests -t .
 ```
+
+The end-to-end tests (`tests/test_incremental_e2e.py`) run the real `app.main.run()` against a fake SAP server and a **real PostgreSQL** (connection from `PG_*` variables, default `postgres@localhost/sap_connector`). They are skipped automatically if PostgreSQL is unreachable. **They drop and re-create the connector tables in that database - point them at a test database.**
 
 **Known gap:** Invoice header fields (e.g. `InvoiceGrossAmount`, `PostingDate`) are fetched from `A_SupplierInvoice`. If this resource is not available in your SAP system, invoice headers will be skipped and the gap reported.
 
+## Incremental Sync
+
+A re-run no longer downloads everything again. The connector remembers how far it got and only asks SAP for records that are new or changed since then.
+
+**How it works**
+
+| Piece | What it does |
+|---|---|
+| `sync_state` table | One **watermark** per entity (`supplier`, `purchase_order`): the highest date value loaded so far. |
+| SAP `$filter` | The next run sends `<DateField> ge <watermark>` (plus `$orderby <DateField> asc`) so only new/changed rows are downloaded. `ge` (not `gt`) is deliberate: a few boundary rows are re-downloaded, which is harmless. |
+| Upsert | `INSERT ... ON CONFLICT DO UPDATE ... WHERE <row> IS DISTINCT FROM <new row>`: new rows inserted, changed rows updated, identical rows untouched. |
+| `change_log` table | A database trigger on all 8 tables records every UPDATE: which record, which columns, old and new value, and the run id. |
+| `run_log` table | One row per run: status (`OK` / `QUOTA` / `FAILED`), SAP calls, inserted/updated/unchanged per table, and the rows the integrity step dropped (count + example keys). |
+| Integrity vs. database | A child row is no longer dropped just because its parent was loaded by an *earlier* run; parents are looked up in PostgreSQL too. |
+| Checkpoints | The run commits after each stage (suppliers, then POs + items, then invoices). A quota error in stage 2 keeps stage 1, and the rows fetched before the error are saved too. |
+
+`sql/incremental.sql` creates the new tables and triggers. The app applies it automatically at the start of every run (it is idempotent). If you re-run `sql/schema.sql` (which drops the data tables), simply start the app once afterwards to re-attach the triggers.
+
+**Settings (`.env`)**
+
+```
+INCREMENTAL=true            # false = old behaviour: always fetch from the start
+FULL_REFRESH=false          # true  = ignore the watermarks for this run only
+SUPPLIER_DATE_FIELD=CreationDate        SUPPLIER_DATE_TYPE=date
+PO_DATE_FIELD=LastChangeDateTime        PO_DATE_TYPE=datetimeoffset
+```
+
+The `*_DATE_FIELD` must be a field the SAP API supports in `$filter` / `$orderby` - check it on the API Business Hub page. If SAP rejects the filter, the connector prints a warning and falls back to a full fetch for that entity (nothing is lost, you just don't save quota). `*_DATE_TYPE` is `date`, `datetime` or `datetimeoffset` (the OData literal type of that field).
+
+**Reading the history**
+
+```sql
+-- what changed in a record, and when?
+SELECT changed_at, changed_fields FROM change_log
+WHERE table_name = 'supplier' AND record_key->>'supplier' = '1000' ORDER BY changed_at;
+
+-- what did the last runs do?
+SELECT started_at, status, mode, sap_calls, stats, dropped FROM run_log ORDER BY started_at DESC LIMIT 5;
+
+-- everything one run changed
+SELECT table_name, record_key, changed_fields FROM change_log WHERE run_id = '<run id>';
+```
+
+**Things to know (limitations)**
+
+- **A date field only catches what it reflects.** `A_Supplier` normally has no "last changed" timestamp, so the default `CreationDate` finds *new* suppliers but not *edits* to old ones. If your system exposes a change timestamp for suppliers, set `SUPPLIER_DATE_FIELD` to it. Edits to a supplier's company / purchasing-org / text rows are only picked up when the supplier itself is re-fetched.
+- **Many records with the same date.** If more than `SUPPLIER_TOP` suppliers share the exact same watermark value (common in demo data with a single `CreationDate`), paging cannot move past them. Raise `SUPPLIER_TOP`.
+- **`PO_TOP` must be large enough to finish a run.** The PO watermark only advances when every supplier chunk completed without hitting `PO_TOP`; otherwise a warning is printed and the watermark stays (so no PO is ever skipped).
+- **PO fetching covers all suppliers stored in the database** (one call per `SAP_FILTER_CHUNK` suppliers per run), not only the suppliers fetched in this run. Suppliers seen for the first time get all of their POs; known suppliers get POs changed since the watermark.
+- **Invoices are looked up for the POs fetched in this run.** A *new invoice on an unchanged PO* is not found until that PO changes or you run once with `FULL_REFRESH=true`.
+- **Deletes** are not detected (the connector never deletes). A deletion flag set in SAP arrives as an update and is logged.
+- `change_log` grows without limit; archive or purge it as you see fit.
+
 ## Out of Scope (v1)
 
-- Incremental sync / change detection
-- Resumable runs / checkpointing (retry + back-off for temporary errors IS implemented)
+- Detecting deletions in SAP
+- Retention / archiving of `change_log`
 - Staging tables
 - Monitoring / notifications
 - Scheduling / orchestration
