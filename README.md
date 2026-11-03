@@ -303,3 +303,23 @@ SELECT table_name, record_key, changed_fields FROM change_log WHERE run_id = '<r
 - Monitoring / notifications
 - Scheduling / orchestration
 - Advanced validation and reconciliation
+
+
+## Dated 03 Nov : Issue to fix:
+**Stage 2 (POs) is where it didn’t go as planned**
+
+There is no PO watermark yet, so it fetched all POs for all 825 stored suppliers.
+
+It hit PO_TOP=2000 after 2000 POs. One supplier (10300006) alone has 1665 POs, so the cap was reached within the first few chunks.
+
+Result: 0 new, 2000 unchanged. These are the same 2000 POs as before, and the POs of your 225 new suppliers were probably never reached.
+
+Because the cap was hit, the code deliberately did not save a PO watermark. It would have skipped POs.
+
+**What was expected from here**
+
+ - Suppliers: each run now continues from the watermark. The next run asks for CreationDate >= 2019-08-19 and gets the next batch of up to 600. It repeats until it reaches the present, after which runs are tiny.
+
+ - POs: as it stands, every run repeats the same 2000 POs and spends about 100 calls for nothing. The PO watermark can only be set by a run that completes without hitting PO_TOP. That’s a chicken-and-egg problem, and your data triggers it.
+
+  - **Fix:** make the PO stage resumable the way suppliers are, with a checkpoint per batch, so a cap or quota stop saves its progress. That removes the need for one giant run.
