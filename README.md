@@ -1,224 +1,380 @@
-# SAP S/4HANA → PostgreSQL Connector
+# SAP S/4HANA → PostgreSQL Connector & DataBridge Dashboard
 
-A Python-based connector that extracts Supplier, Purchase Order, Purchase Order Item, Supplier Invoice, and Invoice-to-PO Reference data from SAP S/4HANA OData APIs and persists it in PostgreSQL while preserving all ERD-defined relationships.
+A production-grade, Python-based connector and modern React web dashboard that extracts Supplier, Purchase Order, Purchase Order Item, Supplier Invoice, and Invoice-to-PO Reference data from SAP S/4HANA OData APIs (V2 XML & V4 JSON) and persists it into PostgreSQL while strictly preserving all ERD-defined relational integrity.
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+  - [Data Integration Flow](#data-integration-flow)
+  - [Web Application Architecture](#web-application-architecture)
+  - [How an Extraction Run Works](#how-an-extraction-run-works)
+- [Prerequisites](#prerequisites)
+- [Setup & Installation](#setup--installation)
+  - [1. Python Environment Setup](#1-python-environment-setup)
+  - [2. PostgreSQL Database & Schema](#2-postgresql-database--schema)
+  - [3. Configure Environment Variables](#3-configure-environment-variables)
+- [Running the Connector](#running-the-connector)
+  - [Option A: Command-Line Pipeline (CLI)](#option-a-command-line-pipeline-cli)
+  - [Option B: Web Dashboard (FastAPI + React)](#option-b-web-dashboard-fastapi--react)
+- [Web Dashboard Features](#web-dashboard-features)
+- [REST API Reference](#rest-api-reference)
+- [Database Schema & ERD](#database-schema--erd)
+- [Incremental Sync & Keyset Architecture](#incremental-sync--keyset-architecture)
+- [Data Verification Queries](#data-verification-queries)
+- [Project Structure](#project-structure)
+- [Testing](#testing)
+- [Troubleshooting & FAQs](#troubleshooting--faqs)
+- [Historical Fix Notes (03 Nov PO Stage)](#historical-fix-notes-03-nov-po-stage)
+
+---
+
+## Overview
+
+Integrating SAP S/4HANA enterprise data into PostgreSQL often suffers from strict API rate limits, non-standard OData protocols, complex composite primary keys, and fragile multi-table foreign key dependencies.
+
+This project solves these challenges with:
+- **Resilient Multi-Protocol Connectors**: Consumes SAP Business Partner (OData V2 XML-Atom), Purchase Order (OData V4 JSON), and Supplier Invoice (OData V2 XML-Atom) APIs.
+- **Stage-by-Stage Checkpoint Commits**: Each stage and batch commits independently to PostgreSQL. A server-side SAP quota limit error never discards already-completed work.
+- **True Keyset Incremental Sync**: Uses `sync_state` watermarks and per-supplier `supplier_po_cursor` tracking with keyset ordering `(F gt V) or (F eq V and Key gt 'k')` to guarantee forward progress even when thousands of records share identical timestamps.
+- **Database Trigger Audit Logging**: Automatically records every field-level row modification in `change_log` and every execution run in `run_log`.
+- **Modern React + Vite Dashboard**: An enterprise web interface (DataBridge) to explore table schemas, inspect column constraints (PKs/FKs), preview live records, trigger sync pipelines, and export custom CSVs.
+
+---
 
 ## Architecture
 
-```
-SAP S/4HANA APIs                      PostgreSQL
-──────────────────                     ──────────
-A_Supplier (OData V2 XML)        →    supplier
-  └─ to_SupplierCompany          →    supplier_company
-  └─ to_SupplierPurchasingOrg    →    supplier_purchasing_org
-  └─ to_SupplierText             →    supplier_text
-PurchaseOrder (OData V4 JSON)    →    purchase_order
-PurchaseOrderItem (OData V4)     →    purchase_order_item
-A_SupplierInvoice (OData V2)     →    supplier_invoice
-A_SuplrInvcItemPurOrdRef (V2)    →    invoice_po_reference
-```
-
-### How a run works
+### Data Integration Flow
 
 ```
-Stage 1   suppliers (+ company / purchasing-org / text)       -> upsert -> COMMIT
-Stage 2   purchase orders in resumable batches (per batch):
-            next POs -> their items -> their invoice refs & headers
-            -> integrity check -> upsert -> advance PO cursor -> COMMIT
-Verify    record counts + relationship queries
+SAP S/4HANA APIs (OData V2 / V4)           PostgreSQL Relational Storage
+─────────────────────────────────          ─────────────────────────────
+A_Supplier (OData V2 XML-Atom)       ──►   supplier
+  ├── to_SupplierCompany             ──►   supplier_company
+  ├── to_SupplierPurchasingOrg       ──►   supplier_purchasing_org
+  └── to_SupplierText                ──►   supplier_text
+
+PurchaseOrder (OData V4 JSON)        ──►   purchase_order
+PurchaseOrderItem (OData V4 JSON)    ──►   purchase_order_item
+
+A_SupplierInvoice (OData V2 XML)     ──►   supplier_invoice
+A_SuplrInvcItemPurOrdRef (V2 XML)    ──►   invoice_po_reference
 ```
 
-Every run is **incremental**: it only asks SAP for records that are new or changed since the last run
-(see [Incremental Sync](#incremental-sync)). Every stage / batch is committed on its own, so a quota
-error never throws away finished work.
+### Web Application Architecture
+
+```
+┌────────────────────────────────┐
+│   React Frontend (Vite :5173)   │
+│   (DataBridge Web Dashboard)   │
+└───────────────┬────────────────┘
+                │ HTTP Requests / REST
+                ▼
+┌────────────────────────────────┐
+│   FastAPI Backend (:8000)      │
+│   (api.py — 19 Endpoints)      │
+└───────┬────────────────┬───────┘
+        │                │
+        │ Direct SQL     │ Executes Pipeline
+        ▼                ▼
+┌──────────────┐   ┌────────────────────────────────┐
+│  PostgreSQL  │   │  Python Connector Modules      │
+│  (:5432)     │   │  (app/connectors/*, mappers)   │
+└──────────────┘   └───────────────┬────────────────┘
+                                   │ OData Calls
+                                   ▼
+                   ┌────────────────────────────────┐
+                   │  SAP S/4HANA Cloud / Sandbox   │
+                   └────────────────────────────────┘
+```
+
+### How an Extraction Run Works
+
+```
+Stage 1: Suppliers  ──► Fetch A_Supplier with $expand (company, org, text)
+                        Map -> Enforce FK integrity -> Upsert -> Update Watermark -> COMMIT
+
+Stage 2: PO Batches ──► In resumable batches (up to PO_BATCH per chunk):
+                        Fetch next POs after per-supplier cursor -> Fetch PO items
+                        Fetch Invoice references & headers -> Enforce referential integrity
+                        Upsert in FK order -> Advance supplier_po_cursor -> COMMIT
+                        (Stops cleanly when PO_TOP budget is reached; resumes next run)
+
+Stage 3: Invoices   ──► Match invoice headers to PO item references -> Upsert -> COMMIT
+
+Verification        ──► Check record counts, verify FK reference chains, log stats to run_log
+```
+
+Every run is **incremental**: it queries SAP only for records that are new or modified since the last saved watermark.
+
+---
 
 ## Prerequisites
 
 - **Python 3.10+**
+- **Node.js 18+ & npm 9+** (for the React web dashboard)
 - **PostgreSQL 13+** running and accessible
-- **SAP S/4HANA** system or SAP API Business Hub sandbox access
+- **SAP S/4HANA System** or **SAP Business Accelerator Hub Sandbox** API Key
 
-## Setup
+---
 
-### 1. Clone and install dependencies
+## Setup & Installation
+
+### 1. Python Environment Setup
+
+Clone the repository and install the backend dependencies:
 
 ```bash
-cd sap-postgres-connector
+cd sap-postgres-connector-staged
 pip install -r requirements.txt
 ```
 
-### 2. Create the PostgreSQL database and schema
+### 2. PostgreSQL Database & Schema
+
+Connect to PostgreSQL and create the target database:
 
 ```sql
--- Connect to PostgreSQL and create the database
 CREATE DATABASE sap_connector;
-
--- Then apply the schema
-\c sap_connector
-\i sql/schema.sql
 ```
 
-Or from the command line:
+Apply the base DDL schema from `sql/schema.sql`:
 
 ```bash
-createdb sap_connector
+# Using psql command line:
 psql -d sap_connector -f sql/schema.sql
 ```
 
-The tables for incremental sync (`sync_state`, `supplier_po_cursor`, `run_log`, `change_log` and the
-change-logging triggers) are created **automatically** at the start of every run from
-`sql/incremental.sql` - you do not need to run it by hand (it is safe to run repeatedly).
+> **Note on Incremental Tables**:
+> The tables for incremental sync (`sync_state`, `supplier_po_cursor`, `run_log`, `change_log`) and the database change-logging triggers are created **automatically** on every run from `sql/incremental.sql`. You do not need to execute `sql/incremental.sql` manually.
+>
+> `sql/schema.sql` drops and re-creates the 8 data tables and cursor tables. Historical audit tables (`run_log`, `change_log`) are preserved.
 
-> `sql/schema.sql` drops and re-creates the 8 data tables **and** the cursor tables
-> (`sync_state`, `supplier_po_cursor`), because the cursors describe what is in those tables.
-> `run_log` and `change_log` are history and are kept.
+### 3. Configure Environment Variables
 
-### 3. Configure environment variables
-
-Copy `.env.example` to `.env` and fill in your values:
+Copy `.env.example` to `.env`:
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` (all options are documented in `.env.example`):
+Edit `.env` with your connection parameters:
 
 ```env
-# SAP connection
+# ===================================================================
+# SAP S/4HANA Connection
+# ===================================================================
 SAP_BASE_URL=https://sandbox.api.sap.com/s4hanacloud
-SAP_API_KEY=your-api-key
+SAP_API_KEY=your-api-key-here
 SAP_AUTH_MODE=apikey
 
-# PostgreSQL connection
+# ===================================================================
+# PostgreSQL Connection
+# ===================================================================
 PG_HOST=localhost
 PG_PORT=5432
 PG_DATABASE=sap_connector
 PG_USER=postgres
-PG_PASSWORD=your-password
+PG_PASSWORD=your-secure-password
+
+# ===================================================================
+# Incremental & Budget Settings (Optional defaults shown)
+# ===================================================================
+INCREMENTAL=true
+FULL_REFRESH=false
+SUPPLIER_TOP=800
+PO_TOP=5000
+PO_BATCH=500
+ITEM_TOP=20000
+INVOICE_TOP=5000
+
+SUPPLIER_DATE_FIELD=CreationDate
+SUPPLIER_DATE_TYPE=date
+PO_DATE_FIELD=LastChangeDateTime
+PO_DATE_TYPE=datetimeoffset
+
+# ===================================================================
+# Throttling & Network Resilience
+# ===================================================================
+SAP_PAGE_SIZE=50
+SAP_FILTER_CHUNK=20
+SAP_USE_EXPAND=true
+SAP_REQUEST_DELAY=0.1
+SAP_MAX_RETRIES=3
+SAP_TIMEOUT=30
 ```
 
-**Auth modes:**
-- `apikey` — sends `APIKey: <key>` header (**required** for the SAP API Business Hub sandbox)
-- `basic` — sends HTTP Basic Auth (for on-premise / BTP systems)
-- `none` — no authentication
+#### Authentication Modes (`SAP_AUTH_MODE`):
+- `apikey` — Sends `APIKey: <key>` header (**required** for the SAP API Business Hub Sandbox).
+- `basic` — Sends HTTP Basic Authentication (`SAP_USERNAME` and `SAP_PASSWORD`).
+- `none` — Disables authentication headers (for mock servers or open proxies).
 
-**Limits and incremental settings** (all optional, defaults shown):
+---
 
-```env
-SUPPLIER_TOP=800       # max suppliers fetched per RUN (the next run continues)
-PO_TOP=5000            # max purchase orders per RUN - a budget, not a requirement
-PO_BATCH=500           # POs per committed batch (PO -> items -> invoices -> commit)
-ITEM_TOP=20000         # safety cap on items per batch
-INVOICE_TOP=5000       # safety cap on invoice references / headers
+## Running the Connector
 
-INCREMENTAL=true       # false = old behaviour: always fetch from the start
-FULL_REFRESH=false     # true  = ignore the cursors for this run only
-SUPPLIER_DATE_FIELD=CreationDate        SUPPLIER_DATE_TYPE=date
-PO_DATE_FIELD=LastChangeDateTime        PO_DATE_TYPE=datetimeoffset
-```
+### Option A: Command-Line Pipeline (CLI)
 
-**Request behaviour** (`SAP_PAGE_SIZE`, `SAP_FILTER_CHUNK`, `SAP_USE_EXPAND`,
-`SAP_REQUEST_DELAY`, `SAP_MAX_RETRIES`, `SAP_TIMEOUT`) is explained in `.env.example`.
-`SUPPLIER_TOP` and `PO_TOP` are budgets **per run**: when one is used up the run stops cleanly and the next
-run continues from where it stopped.
-
-## Execution
-
-Run the complete extraction from the project root:
+To run the complete extraction pipeline directly from your terminal:
 
 ```bash
 python -m app.main
 ```
 
 The script will:
-1. Connect to SAP and PostgreSQL, apply `sql/incremental.sql`, and start a run (`run_log` row + run id)
-2. **Stage 1** - fetch suppliers with their company / purchasing-org / text records (`$expand`, paged),
-   starting after the supplier cursor; map, check integrity, upsert, advance the cursor, **commit**
-3. **Stage 2** - load purchase orders in batches. For each batch: fetch the next POs after the PO cursor
-   of a group of suppliers, their items, and their invoice references and headers; map; check referential
-   integrity (against this batch **and** the database); upsert in FK order; advance the PO cursors; **commit**.
-   The stage stops when `PO_TOP` POs were loaded in this run - the next run continues
-4. Print record counts and run relationship-verification queries
+1. Initialize the PostgreSQL connection and automatically apply `sql/incremental.sql`.
+2. Generate a unique `run_id` and create an entry in `run_log`.
+3. **Stage 1**: Stream suppliers with associated companies, purchasing organizations, and texts via `$expand`, checking integrity and upserting into PostgreSQL.
+4. **Stage 2**: Stream purchase orders and items in resumable batches using keyset cursors.
+5. **Stage 3**: Fetch invoice cross-references and headers, dropping orphaned references to maintain referential integrity.
+6. Verify record counts and print an execution summary.
 
-Rows are **upserted**: new rows are inserted, changed rows are updated (and logged in `change_log`),
-identical rows are left untouched. The number of SAP calls is printed after every stage and batch.
+Re-run the command until the log no longer displays `PO_TOP reached - N supplier(s) still to be scanned`. Future runs will only fetch delta changes.
 
-Re-run the command until the log no longer says `PO_TOP reached - N supplier(s) still to be scanned`.
-After that, runs are tiny (about one call for suppliers plus one call per `SAP_FILTER_CHUNK` stored suppliers).
+---
 
-## Project Structure
+### Option B: Web Dashboard (FastAPI + React)
 
+The project includes an enterprise web dashboard for monitoring sync status, inspecting schemas, triggering extractions, and exporting data.
+
+#### Step 1: Start the FastAPI Backend
+From the project root:
+
+```powershell
+uvicorn api:app --reload
 ```
-sap-postgres-connector/
-├── app/
-│   ├── __init__.py
-│   ├── config.py                 # Environment / .env loader
-│   ├── sap_client.py             # SAP HTTP client: throttle, retry, quota fail-fast
-│   ├── odata.py                  # OData parsing, paging, $filter chunking helpers
-│   ├── integrity.py              # FK-consistency check between mapping and insert
-│   ├── db.py                     # PostgreSQL connection factory
-│   ├── sync_state.py             # supplier cursor, PO cursors, run log, run-id tagging, known keys
-│   ├── models.py                 # Python dataclasses for all 8 tables
-│   ├── main.py                   # Orchestrator: stages, resumable PO batches, checkpoints
-│   ├── connectors/
-│   │   ├── supplier_connector.py       # Supplier API (OData V2), keyset paging
-│   │   ├── purchase_order_connector.py # PO API (OData V4), resumable batch fetch
-│   │   └── invoice_connector.py        # Invoice API (OData V2)
-│   ├── mapping/
-│   │   └── mappers.py            # SAP field → PostgreSQL column mappers
-│   └── repositories/
-│       └── repositories.py       # upsert logic (insert / update-if-changed) for all 8 tables
-├── api.py                        # FastAPI backend — 19 REST endpoints for the web dashboard
-├── sql/
-│   ├── schema.sql                # PostgreSQL DDL (8 data tables; drops data + cursor tables)
-│   └── incremental.sql           # sync_state, supplier_po_cursor, run_log, change_log + triggers (auto-applied)
-├── frontend/                     # React (Vite) web dashboard
-├── tests/
-│   ├── test_mappers.py           # Unit tests for mapping functions
-│   ├── test_odata.py             # OData parsing, paging, $filter helpers
-│   ├── test_sap_client.py        # throttle / retry / quota behaviour
-│   ├── test_connectors.py        # call counts, $expand fallback, quota propagation
-│   ├── test_integrity.py         # FK-consistency check
-│   ├── test_incremental_units.py # keyset filters, connectors, integrity with DB keys (no DB)
-│   └── test_incremental_e2e.py   # full run vs. fake SAP + real PostgreSQL
-├── diag_test.py                  # endpoint diagnostic (1 call per probe)
-├── API_REFERENCE.md              # Full REST API documentation (19 endpoints)
-├── .env.example
-├── .gitignore
-├── requirements.txt
-└── README.md
+- **Backend URL**: `http://127.0.0.1:8000`
+- **Interactive OpenAPI Docs**: `http://127.0.0.1:8000/docs`
+
+#### Step 2: Start the React Frontend
+In a second terminal:
+
+```powershell
+cd frontend
+npm install
+npm run dev
 ```
+- **Frontend URL**: `http://localhost:5173`
 
-## Database Schema (ERD)
+The Vite development server is configured with a built-in reverse proxy that forwards `/api/*` requests directly to `http://127.0.0.1:8000`.
 
-The schema implements 8 tables with the following relationships:
+---
 
-| Parent Table         | Child Table             | Relationship |
-|----------------------|-------------------------|--------------|
-| supplier             | supplier_company        | 1 → N        |
-| supplier             | supplier_purchasing_org | 1 → N        |
-| supplier             | supplier_text           | 1 → N        |
-| supplier             | purchase_order          | 1 → N        |
-| supplier             | supplier_invoice        | 1 → N        |
-| purchase_order       | purchase_order_item     | 1 → N        |
-| purchase_order       | supplier_invoice        | 1 → N        |
-| supplier_invoice     | invoice_po_reference    | 1 → N        |
-| purchase_order_item  | invoice_po_reference    | 1 → N        |
+## Web Dashboard Features
 
-Composite primary keys:
-- `supplier_company`: (supplier, company_code)
-- `supplier_purchasing_org`: (supplier, purchasing_organization)
-- `supplier_text`: (supplier, language, text_type)
-- `supplier_invoice`: (supplier_invoice, fiscal_year)
-- `purchase_order_item`: (purchase_order, purchase_order_item)
-- `invoice_po_reference`: (supplier_invoice, fiscal_year, purchase_order, purchase_order_item, supplier_invoice_item)
+| Section | Capabilities |
+|---|---|
+| **System Overview** | Displays live KPI metrics (total tables, records persisted in PostgreSQL, active connectors, last sync status) and an interactive entity catalog grid. |
+| **Database Explorer** | Inspects all 8 PostgreSQL tables. Switch between **Schema & Relationships** (columns, data types, primary keys, foreign key targets, descriptions) and **Data Preview** with adjustable row limits (10 to 100). |
+| **Data Extraction** | Trigger live SAP extraction pipelines with a **Full Refresh** toggle and real-time status tracking. Also includes custom column selection with UTF-8 BOM CSV export. |
+| **Active Connectors** | Displays metadata, protocols (`OData V2 XML` vs `OData V4 JSON`), endpoints, and resilience capabilities for Supplier, Purchase Order, and Invoice connectors. |
+| **Sync History & Watermarks** | Inspects current keyset watermarks from `sync_state` and execution audit history from `run_log`. |
+| **Data Lineage** | Visual diagram showing end-to-end data flow from SAP OData services into PostgreSQL relational tables. |
 
-## Verification Queries
+---
 
-After a successful run, verify the data:
+## REST API Reference
+
+The FastAPI backend exposes 19 REST endpoints:
+
+| Group | Method | Endpoint | Purpose |
+|---|---|---|---|
+| **Health** | GET | `/api/health` | Backend and PostgreSQL database connectivity check |
+| **Connectors** | GET | `/api/connectors` | List all implemented SAP connectors with capabilities |
+| **Connectors** | GET | `/api/connectors/{connector_id}` | Retrieve specific connector details |
+| **Tables** | GET | `/api/tables` | List all 8 database tables with record counts |
+| **Tables** | GET | `/api/tables/{table_name}/schema` | Complete table schema (columns, types, PKs, FKs, descriptions) |
+| **Tables** | GET | `/api/tables/{table_name}/records` | Paginated records with optional search and limit |
+| **Entities** | GET | `/api/entities` | List entities compatible with frontend catalog |
+| **Entities** | GET | `/api/entities/{entity}/fields` | Column structure with dataclass fallback if DB offline |
+| **Entities** | GET | `/api/entities/{entity}/records` | Preview records for a given entity |
+| **SAP Entities** | GET | `/api/sap-entities` | SAP entities with mandatory vs. optional field breakdown |
+| **SAP Entities** | GET | `/api/sap-entities/{entity_id}` | SAP entity details with enriched descriptions |
+| **Extraction** | POST | `/api/extract` | Trigger asynchronous SAP extraction pipeline |
+| **Extraction** | GET | `/api/extract/{extraction_id}` | Poll running extraction status and progress |
+| **Extraction** | GET | `/api/extractions` | List current session extraction tasks |
+| **History** | GET | `/api/history/runs` | List extraction runs from `run_log` |
+| **History** | GET | `/api/history/runs/{run_id}` | Detailed run log entry with dropped record statistics |
+| **History** | GET | `/api/history/changes` | Query audit `change_log` entries by table or run ID |
+| **Sync State** | GET | `/api/sync-state` | Retrieve active incremental watermarks and PO cursor stats |
+| **Dashboard** | GET | `/api/dashboard/stats` | Aggregated dashboard summary statistics |
+
+> For comprehensive request/response payloads, see [`API_REFERENCE.md`](API_REFERENCE.md).
+
+---
+
+## Database Schema & ERD
+
+The relational schema implements 8 tables with strict foreign key constraints:
+
+| Parent Table | Child Table | Relationship | Cascade / Action |
+|---|---|---|---|
+| `supplier` | `supplier_company` | 1 → N | On Delete Cascade |
+| `supplier` | `supplier_purchasing_org` | 1 → N | On Delete Cascade |
+| `supplier` | `supplier_text` | 1 → N | On Delete Cascade |
+| `supplier` | `purchase_order` | 1 → N | Enforced by Integrity Layer |
+| `supplier` | `supplier_invoice` | 1 → N | Nullable link |
+| `purchase_order` | `purchase_order_item` | 1 → N | On Delete Cascade |
+| `purchase_order` | `supplier_invoice` | 1 → N | Referenced in invoice header |
+| `purchase_order_item` | `invoice_po_reference` | 1 → N | On Delete Cascade |
+| `supplier_invoice` | `invoice_po_reference` | 1 → N | Composite FK reference |
+
+### Composite Primary Keys
+
+- `supplier_company`: `(supplier, company_code)`
+- `supplier_purchasing_org`: `(supplier, purchasing_organization)`
+- `supplier_text`: `(supplier, language, text_type)`
+- `purchase_order_item`: `(purchase_order, purchase_order_item)`
+- `supplier_invoice`: `(supplier_invoice, fiscal_year)`
+- `invoice_po_reference`: `(supplier_invoice, fiscal_year, purchase_order, purchase_order_item, supplier_invoice_item)`
+
+---
+
+## Incremental Sync & Keyset Architecture
+
+Every sync run uses keyset pagination to avoid missing records:
+
+| Mechanism | Description |
+|---|---|
+| **`sync_state` Table** | Tracks the global watermark for master entities: the last `(watermark_value, last_key)` processed. |
+| **`supplier_po_cursor` Table** | Maintains an independent PO cursor per supplier: the last `(date, purchase_order)` synced. This allows PO batches to stop and resume cleanly. |
+| **Keyset `$filter` Predicate** | Requests rows ordered oldest-first: `(DateField gt Value) or (DateField eq Value and Key gt 'last_key')`. Avoids pagination loops when multiple rows share the same timestamp. |
+| **Idempotent Upsert** | Uses `INSERT ... ON CONFLICT DO UPDATE ... WHERE target IS DISTINCT FROM excluded`. Identical rows produce no database writes or change-log noise. |
+| **`change_log` Triggers** | PostgreSQL triggers on all 8 tables record every `UPDATE`: records modified columns, old and new values, timestamp, and `run_id`. |
+| **`run_log` History** | Records run mode (`INCREMENTAL` / `FULL_REFRESH`), status (`SUCCESS`, `QUOTA`, `FAILED`), SAP call counts, and dropped orphan records. |
+
+### Querying the Audit History
 
 ```sql
--- Record counts
-SELECT 'supplier' AS tbl, COUNT(*) FROM supplier
+-- View recent extraction runs and call counts
+SELECT run_id, started_at, status, mode, sap_calls, stats
+FROM run_log
+ORDER BY started_at DESC
+LIMIT 5;
+
+-- Inspect field-level modifications made by a specific run
+SELECT table_name, record_key, changed_fields, changed_at
+FROM change_log
+WHERE run_id = 'YOUR-RUN-ID-HERE'
+ORDER BY changed_at;
+
+-- Track changes made to a specific supplier over time
+SELECT changed_at, changed_fields
+FROM change_log
+WHERE table_name = 'supplier' AND record_key->>'supplier' = '1000'
+ORDER BY changed_at;
+```
+
+---
+
+## Data Verification Queries
+
+Execute these queries in PostgreSQL to verify data consistency after a run:
+
+```sql
+-- 1. Check record counts across all 8 tables
+SELECT 'supplier' AS table_name, COUNT(*) FROM supplier
 UNION ALL SELECT 'supplier_company', COUNT(*) FROM supplier_company
 UNION ALL SELECT 'supplier_purchasing_org', COUNT(*) FROM supplier_purchasing_org
 UNION ALL SELECT 'supplier_text', COUNT(*) FROM supplier_text
@@ -227,10 +383,16 @@ UNION ALL SELECT 'purchase_order_item', COUNT(*) FROM purchase_order_item
 UNION ALL SELECT 'supplier_invoice', COUNT(*) FROM supplier_invoice
 UNION ALL SELECT 'invoice_po_reference', COUNT(*) FROM invoice_po_reference;
 
--- Supplier → PO → PO Item → Invoice reference chain
-SELECT s.supplier, s.supplier_name,
-       po.purchase_order, poi.purchase_order_item,
-       ipr.supplier_invoice, ipr.fiscal_year
+-- 2. Verify complete relational chain: Supplier -> PO -> PO Item -> Invoice Reference
+SELECT s.supplier,
+       s.supplier_name,
+       po.purchase_order,
+       poi.purchase_order_item,
+       poi.net_price_amount,
+       poi.document_currency,
+       ipr.supplier_invoice,
+       ipr.fiscal_year,
+       ipr.referenced_amount
 FROM supplier s
 JOIN purchase_order po ON po.supplier = s.supplier
 JOIN purchase_order_item poi ON poi.purchase_order = po.purchase_order
@@ -240,291 +402,108 @@ JOIN invoice_po_reference ipr
 LIMIT 10;
 ```
 
-## SAP API Assumptions
+---
 
-| API | Protocol | Format | Notes |
-|-----|----------|--------|-------|
-| A_Supplier | OData V2 | XML/Atom | Navigation links for company, purch-org, text |
-| PurchaseOrder | OData V4 | JSON | Filtered by Supplier |
-| PurchaseOrderItem | OData V4 | JSON | Filtered by PurchaseOrder |
-| A_SupplierInvoice | OData V2 | XML/Atom | Fetched by composite key (invoice + fiscal year) |
-| A_SuplrInvcItemPurOrdRef | OData V2 | XML/Atom | Filtered by PurchaseOrder |
+## Project Structure
 
-**Known gap:** Invoice header fields (e.g. `InvoiceGrossAmount`, `PostingDate`) are fetched from `A_SupplierInvoice`. If this resource is not available in your SAP system, invoice headers will be skipped and the gap reported.
-
-## Troubleshooting
-
-### `policies.ratelimit.QuotaViolation` (HTTP 500)
-
-```json
-{"fault":{"faultstring":"Rate limit quota violation. Quota limit  exceeded...","detail":{"errorcode":"policies.ratelimit.QuotaViolation"}}}
+```
+sap-postgres-connector/
+├── app/
+│   ├── __init__.py
+│   ├── config.py                 # Configuration and environment loader
+│   ├── db.py                     # PostgreSQL connection factory
+│   ├── integrity.py              # Foreign key referential consistency enforcement
+│   ├── main.py                   # CLI Orchestrator: stages, batches, checkpoints
+│   ├── models.py                 # Python dataclasses mirroring the 8 schema tables
+│   ├── odata.py                  # OData XML/JSON parsing, chunking, and paging
+│   ├── sap_client.py             # SAP HTTP client: throttling, retry, quota handling
+│   ├── sync_state.py             # Watermarks, PO cursors, and run log management
+│   ├── connectors/
+│   │   ├── supplier_connector.py       # Supplier API (OData V2 XML), $expand
+│   │   ├── purchase_order_connector.py # PO & Items API (OData V4 JSON), batch OR
+│   │   └── invoice_connector.py        # Invoice & Ref API (OData V2 XML)
+│   ├── mapping/
+│   │   └── mappers.py            # SAP payload -> Dataclass mappers
+│   └── repositories/
+│       └── repositories.py       # Idempotent upsert repositories for all 8 tables
+├── frontend/                     # React + Vite Enterprise Web Dashboard
+│   ├── public/                   # Static assets & icons
+│   ├── src/
+│   │   ├── App.jsx               # Main dashboard component
+│   │   ├── App.css               # Clean enterprise styling
+│   │   ├── index.css             # Base reset & design tokens
+│   │   └── main.jsx              # Application entry point
+│   ├── package.json              # Frontend dependencies (React 19, Vite)
+│   └── vite.config.js            # Vite build configuration with /api proxy
+├── sql/
+│   ├── schema.sql                # Base DDL for the 8 relational data tables
+│   └── incremental.sql           # sync_state, cursors, run_log, change_log triggers
+├── tests/
+│   ├── test_connectors.py        # Unit tests for connector API handling
+│   ├── test_incremental_e2e.py   # Full pipeline E2E test with fake SAP + real PG
+│   ├── test_incremental_units.py # Keyset filters and cursor unit tests
+│   ├── test_integrity.py         # Referential integrity enforcement tests
+│   ├── test_mappers.py           # Field mapping unit tests
+│   ├── test_odata.py             # XML/JSON parsing and $filter chunking tests
+│   └── test_sap_client.py        # Throttling, retry, and quota error propagation
+├── api.py                        # FastAPI backend REST API (19 endpoints)
+├── API_REFERENCE.md              # Complete REST endpoint specifications
+├── diag_test.py                  # Single-call probe diagnostic utility
+├── .env.example                  # Environment configuration template
+├── requirements.txt              # Python runtime dependencies
+└── README.md                     # Project documentation
 ```
 
-The SAP API Business Hub gateway allows each API key only a limited number of calls and answers
-with this error when it is used up (note: it uses HTTP **500**, not 429). This is a **server-side
-limit — no code change can restore the quota**; you have to wait until it resets or use another key.
+---
 
-What the connector does about it:
-- makes far fewer calls (grouped filters, `$expand`, paging) so a run fits in the quota;
-- throttles calls (`SAP_REQUEST_DELAY`) and retries *temporary* errors (spike arrest, 503) with back-off;
-- on a real quota error it **stops immediately** (exit code 2) and sends no further requests. Everything committed before the error stays (finished stages and batches, and the suppliers / POs fetched just before the error where safe); only the batch in flight is lost. Re-run after the quota resets and it **continues from the saved cursors**;
-- `python diag_test.py` checks every endpoint with one call each and stops at the first quota error.
+## Testing
 
-### `PO_TOP reached - N supplier(s) still to be scanned`
-Not an error. `PO_TOP` is the number of POs one run may load; the rest is picked up by the next run.
-Progress: compare `SELECT count(*) FROM supplier_po_cursor` with `SELECT count(*) FROM supplier`.
-
-### `SAP rejected the supplier / PO date filter ...`
-The date field in `SUPPLIER_DATE_FIELD` / `PO_DATE_FIELD` is not supported in `$filter` / `$orderby` (or its
-`*_DATE_TYPE` is wrong). The connector falls back to a plain full fetch, so nothing is lost, but you do not
-get the quota saving or resumability. Check the field on the API Business Hub page and fix the `.env` setting.
-
-### `The data tables are empty but ... existed - reset`
-The tables were truncated or re-created while the cursors survived. The app discards the (now false)
-cursors and fetches everything again from the start.
-
-### `UnicodeEncodeError: 'charmap' codec can't encode ...` (Windows)
-Happened when output was redirected (`> file`, `| Out-File`) and the script printed a non-ASCII
-character. The scripts now force UTF-8 output and use ASCII markers.
-
-### Upgrading an existing database
-`supplier_text.text` changed from `VARCHAR(255)` to `TEXT` (SAP long texts are longer and made the
-whole load fail). Either re-run `sql/schema.sql` (drops and recreates all tables) or keep your data with:
-
-```sql
-ALTER TABLE supplier_text ALTER COLUMN text TYPE TEXT;
-```
-
-**Upgrading from the first incremental version** (supplier/PO watermarks only): nothing to do. At the next start the
-app adds the `last_key` column to `sync_state` and creates `supplier_po_cursor`. Your existing supplier watermark is
-kept (it is used without a key once, then with a key). Suppliers have no PO cursor yet, so their POs are scanned
-once from the oldest; rows you already have arrive as "unchanged".
-
-## Tests
+Run the test suite using Python's built-in `unittest` runner:
 
 ```bash
 python -m unittest discover -s tests -t .
 ```
 
-The end-to-end tests (`tests/test_incremental_e2e.py`) run the real `app.main.run()` against a fake SAP server and a **real PostgreSQL** (connection from `PG_*` variables, default `postgres@localhost/sap_connector`). They are skipped automatically if PostgreSQL is unreachable. **They drop and re-create the connector tables in that database - point them at a test database.**
+- **Unit Tests**: Test mappings, OData parser, integrity checks, and throttling without hitting SAP or PostgreSQL.
+- **End-to-End Tests (`tests/test_incremental_e2e.py`)**: Runs `app.main.run()` against a mocked SAP server and a real PostgreSQL instance (configured via `PG_*` variables). If PostgreSQL is offline, E2E tests are safely skipped.
 
-## Incremental Sync
+---
 
-A re-run no longer downloads everything again. The connector remembers how far it got and only asks SAP for records that are new or changed since then.
+## Troubleshooting & FAQs
 
-**How it works**
-
-| Piece | What it does |
-|---|---|
-| `sync_state` table | The **supplier watermark**: the last `(date, Supplier)` loaded. |
-| `supplier_po_cursor` table | A **PO cursor per supplier**: the last `(date, PurchaseOrder)` loaded. This is what makes the PO stage resumable. |
-| SAP `$filter` | Rows are requested oldest-first (`$orderby <DateField> asc, <Key> asc`) and strictly *after* the cursor: `(F gt V) or (F eq V and Key gt 'k')`. This **keyset paging** keeps moving forward even if thousands of rows share one timestamp. (A cursor without a key, e.g. from an older version, uses `F ge V`.) |
-| Upsert | `INSERT ... ON CONFLICT DO UPDATE ... WHERE <row> IS DISTINCT FROM <new row>`: new rows inserted, changed rows updated, identical rows untouched. |
-| `change_log` table | A database trigger on all 8 tables records every UPDATE: which record, which columns, old and new value, and the run id. |
-| `run_log` table | One row per run: status (`OK` / `QUOTA` / `FAILED`), SAP calls, inserted/updated/unchanged per table, and the rows the integrity step dropped (count + example keys). |
-| Integrity vs. database | A child row is no longer dropped just because its parent was loaded by an *earlier* run; parents are looked up in PostgreSQL too. |
-| Resumable batches | Suppliers are one committed stage. POs are loaded in **batches**: next `PO_BATCH` POs -> their items -> their invoices -> upsert -> advance the PO cursor -> COMMIT. `PO_TOP` is the budget of POs *per run*; when it is used up the run stops and the next run carries on. A quota error loses only the batch in flight. |
-
-`sql/incremental.sql` creates the new tables and triggers. The app applies it automatically at the start of every run (it is idempotent). If you re-run `sql/schema.sql` (which drops the data tables), simply start the app once afterwards to re-attach the triggers.
-
-**Settings (`.env`)**
-
+### 1. `policies.ratelimit.QuotaViolation` (HTTP 500)
+```json
+{"fault":{"faultstring":"Rate limit quota violation. Quota limit exceeded...","detail":{"errorcode":"policies.ratelimit.QuotaViolation"}}}
 ```
-INCREMENTAL=true            # false = old behaviour: always fetch from the start
-FULL_REFRESH=false          # true  = ignore the watermarks for this run only
-SUPPLIER_DATE_FIELD=CreationDate        SUPPLIER_DATE_TYPE=date
-PO_DATE_FIELD=LastChangeDateTime        PO_DATE_TYPE=datetimeoffset
-PO_TOP=2000                 # max POs per RUN (the run stops there; the next run continues)
-PO_BATCH=500                # POs per committed batch (checkpoint)
-```
+- **Cause**: The SAP API Business Hub gateway enforces daily call quotas per API key.
+- **Resolution**: This is a server-side limit. The connector immediately halts execution (exit code 2) upon encountering this error. Because previous stages and batches were committed at checkpoints, **no finished work is lost**. Wait until your quota resets or supply a new `SAP_API_KEY` in `.env`, then re-run. Execution automatically resumes from the saved cursor.
 
-The `*_DATE_FIELD` must be a field the SAP API supports in `$filter` / `$orderby` - check it on the API Business Hub page. If SAP rejects the filter or ordering, the connector prints a warning and falls back to a plain full fetch for that entity (nothing is lost, you just don't save quota or get resumability). `*_DATE_TYPE` is `date`, `datetime` or `datetimeoffset` (the OData literal type of that field).
+### 2. `PO_TOP reached - N supplier(s) still to be scanned`
+- **Cause**: Normal operational message. `PO_TOP` defines the maximum POs permitted per run to prevent timeout or quota exhaustion.
+- **Resolution**: Re-run `python -m app.main`. The connector resumes scanning the remaining suppliers.
 
-**Reading the history**
+### 3. `SAP rejected the supplier / PO date filter`
+- **Cause**: The SAP system does not support filtering or ordering on the specified `SUPPLIER_DATE_FIELD` or `PO_DATE_FIELD`.
+- **Resolution**: Verify the field name against your SAP system metadata. The connector automatically falls back to a full fetch to prevent data loss.
 
-```sql
--- what changed in a record, and when?
-SELECT changed_at, changed_fields FROM change_log
-WHERE table_name = 'supplier' AND record_key->>'supplier' = '1000' ORDER BY changed_at;
+### 4. `UnicodeEncodeError: 'charmap' codec can't encode...` (Windows)
+- **Cause**: Windows PowerShell or Command Prompt using legacy code pages (e.g., CP1252) when redirecting output.
+- **Resolution**: The connector forces UTF-8 stream output by default. If running custom scripts, set `$env:PYTHONIOENCODING="utf-8"`.
 
--- what did the last runs do?
-SELECT started_at, status, mode, sap_calls, stats, dropped FROM run_log ORDER BY started_at DESC LIMIT 5;
+### 5. `ALTER TABLE supplier_text ALTER COLUMN text TYPE TEXT`
+- **Cause**: SAP long texts exceeding standard `VARCHAR(255)` length limits.
+- **Resolution**: In `sql/schema.sql`, `supplier_text.text` is defined as `TEXT`. If migrating an older database, execute:
+  ```sql
+  ALTER TABLE supplier_text ALTER COLUMN text TYPE TEXT;
+  ```
 
--- everything one run changed
-SELECT table_name, record_key, changed_fields FROM change_log WHERE run_id = '<run id>';
-```
+---
 
-**Things to know (limitations)**
+## Historical Fix Notes (03 Nov PO Stage)
 
-- **A date field only catches what it reflects.** `A_Supplier` normally has no "last changed" timestamp, so the default `CreationDate` finds *new* suppliers but not *edits* to old ones. If your system exposes a change timestamp for suppliers, set `SUPPLIER_DATE_FIELD` to it. Edits to a supplier's company / purchasing-org / text rows are only picked up when the supplier itself is re-fetched.
-- **`PO_TOP` is a per-run budget, not a requirement.** Initial loads simply take several runs; each run continues where the previous one stopped. Suppliers never synced for POs are scanned first (oldest PO first).
-- **The first PO run re-reads POs you already have.** Suppliers have no PO cursor yet, and POs loaded by older versions came in unordered, so they cannot be trusted to be gap-free. They arrive as "unchanged" (no change-log noise).
-- **Once a supplier's POs are caught up** its cursor is set to "now minus 1 day" (covers clock differences with SAP). Later runs ask only for POs changed after that - typically one cheap call per group of `SAP_FILTER_CHUNK` suppliers.
-- **PO fetching covers all suppliers stored in the database**, not only those fetched in this run.
-- **Invoices are looked up for the POs of each batch.** A *new invoice on an unchanged, already-loaded PO* is not found until that PO changes or you run once with `FULL_REFRESH=true`.
-- **`FULL_REFRESH=true`** ignores the cursors and starts from the oldest record, but is still limited by `PO_TOP` per run. Cursors only move forward, so afterwards a normal run continues from them.
-- **Stale cursors are discarded.** If the data tables are empty but cursors exist (tables truncated), the app resets the cursors with a warning. `sql/schema.sql` also drops `sync_state` and `supplier_po_cursor` for the same reason.
-- **Rows without a value in the date field** are only loaded by a from-the-beginning fetch; later changes to them are not detected by the date filter.
-- **Deletes** are not detected (the connector never deletes). A deletion flag set in SAP arrives as an update and is logged.
-- `change_log` grows without limit; archive or purge it as you see fit.
+In earlier iterations, Stage 2 attempted to fetch purchase orders for all suppliers in a single monolithic run without a per-supplier cursor. When high-volume suppliers (e.g., vendor `10300006` with 1,600+ POs) were encountered, the run exhausted `PO_TOP` early, leaving later suppliers un-scanned and preventing a global watermark from being saved.
 
-## Out of Scope (v1)
-
-- Detecting deletions in SAP
-- Retention / archiving of `change_log`
-- Staging tables
-- Monitoring / notifications
-- Scheduling / orchestration
-- Advanced validation and reconciliation
-
-
-## Dated 03 Nov: Issue in the PO stage - fixed
-
-**Status: resolved** by resumable PO batches with per-supplier cursors (see [Incremental Sync](#incremental-sync)).
-
-### What was observed (first incremental version)
-
-**Stage 2 (POs) is where it didn’t go as planned**
-
-There is no PO watermark yet, so it fetched all POs for all 825 stored suppliers.
-
-It hit PO_TOP=2000 after 2000 POs. One supplier (10300006) alone has 1665 POs, so the cap was reached within the first few chunks.
-
-Result: 0 new, 2000 unchanged. These are the same 2000 POs as before, and the POs of your 225 new suppliers were probably never reached.
-
-Because the cap was hit, the code deliberately did not save a PO watermark. It would have skipped POs.
-
-**What was expected from here**
-
- - Suppliers: each run now continues from the watermark. The next run asks for CreationDate >= 2019-08-19 and gets the next batch of up to 600. It repeats until it reaches the present, after which runs are tiny.
-
- - POs: as it stands, every run repeats the same 2000 POs and spends about 100 calls for nothing. The PO watermark can only be set by a run that completes without hitting PO_TOP. That’s a chicken-and-egg problem, and your data triggers it.
-
-  - **Proposed fix:** make the PO stage resumable the way suppliers are, with a checkpoint per batch, so a cap or quota stop saves its progress. That removes the need for one giant run.
-
-### What changed
-
-- **PO cursors per supplier** (table `supplier_po_cursor`) replace the single PO watermark. Each supplier remembers the last
-  `(date, PurchaseOrder)` loaded, so a stop at any point is resumable.
-- **Batches with a checkpoint each:** next `PO_BATCH` POs -> items -> invoices -> upsert -> cursor -> COMMIT.
-  A quota error loses only the batch in flight.
-- **`PO_TOP` is a budget per run**, not something that must be large enough to finish. Initial loads simply take several runs.
-- **Keyset paging** `(F gt V) or (F eq V and Key gt 'k')` instead of `F ge V`, so thousands of POs (or suppliers) sharing one
-  timestamp / date cannot stall paging. This matters for supplier 10300006 and for suppliers sharing one `CreationDate`.
-- **Safety:** cursors that no longer match the data (tables emptied) are discarded automatically.
-
-### What to expect on the next runs (after upgrading)
-
-1. **Stage 1:** asks for `CreationDate >= 2019-08-19` (oldest first, up to `SUPPLIER_TOP`). Suppliers on the boundary day come back
-   as "unchanged", the others are new; a new supplier cursor with a key is saved.
-2. **Stage 2:** no supplier has a PO cursor yet, so POs are scanned from the oldest, in batches, until `PO_TOP` is used up. Many POs in
-   the first batches are ones you already have and show as "unchanged" (no `change_log` noise). The run ends with
-   `PO_TOP reached - N supplier(s) still to be scanned` - a normal, successful exit.
-3. **Run again.** Each run moves forward by up to `PO_TOP` POs and `SUPPLIER_TOP` suppliers (about 170 SAP calls at `PO_TOP=2000`).
-   When the "still to be scanned" line disappears you are caught up; from then on runs download almost nothing.
-4. If you see `SAP rejected the ... date filter`, see Troubleshooting.
-
-
-## Web Dashboard (React)
-
-The project includes a React-based web dashboard that provides a user interface for interacting with the SAP S/4HANA to PostgreSQL connector.
-
-### Architecture
-
-```text
-React Frontend (Vite)
-        |
-        | HTTP Requests
-        v
-FastAPI Backend
-        |
-        v
-Python Connector Modules
-        |
-        v
-SAP S/4HANA APIs
-
-FastAPI Backend
-        |
-        v
-PostgreSQL Database
-```
-
-### Frontend Features
-
-- **Dashboard:** View available SAP data entities and explore their fields.
-- **Entity Selection:** Select database entities and fields to inspect.
-- **Data Preview:** Preview records retrieved from PostgreSQL.
-- **Data Export:** Download selected data as CSV.
-- **Backend Integration:** Communicate with the FastAPI backend through REST APIs.
-
-### Technology Stack
-
-| Component | Technology |
-|---|---|
-| Frontend | React.js |
-| Frontend Tooling | Vite |
-| Backend API | FastAPI |
-| Database | PostgreSQL |
-| Data Extraction | Python |
-| Source APIs | SAP S/4HANA OData |
-
-### Running the Web Application
-
-**1. Start the FastAPI backend**
-
-From the project root:
-
-```bash
-uvicorn api:app --reload
-```
-
-The backend runs at:
-
-`http://127.0.0.1:8000`
-
-API documentation is available at:
-
-`http://127.0.0.1:8000/docs`
-
-**2. Start the React frontend**
-
-Open another terminal:
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-Open the local URL displayed by Vite in your browser.
-
-**3. Backend API Endpoints**
-
-The backend exposes 19 REST endpoints grouped by feature area:
-
-| Group | Method | Endpoint | Purpose |
-|---|---|---|---|
-| Health | GET | `/api/health` | Backend + database health check |
-| Connectors | GET | `/api/connectors` | List all SAP connectors with metadata |
-| Connectors | GET | `/api/connectors/{id}` | Single connector detail |
-| Tables | GET | `/api/tables` | List 8 DB tables with record counts |
-| Tables | GET | `/api/tables/{name}/schema` | Full schema: columns, types, PKs, FKs, descriptions |
-| Tables | GET | `/api/tables/{name}/records` | Paginated records with search & sort |
-| Entities | GET | `/api/entities` | List entities (frontend compat) |
-| Entities | GET | `/api/entities/{entity}/fields` | Entity field metadata |
-| Entities | GET | `/api/entities/{entity}/records` | Entity records |
-| SAP Entities | GET | `/api/sap-entities` | SAP entities with mandatory / optional fields |
-| SAP Entities | GET | `/api/sap-entities/{id}` | SAP entity detail + enriched field list |
-| Extraction | POST | `/api/extract` | Trigger data extraction |
-| Extraction | GET | `/api/extract/{id}` | Check extraction status |
-| Extraction | GET | `/api/extractions` | List all extractions (session) |
-| History | GET | `/api/history/runs` | Extraction run log |
-| History | GET | `/api/history/runs/{run_id}` | Run detail + change count |
-| History | GET | `/api/history/changes` | Change log entries (filterable) |
-| Sync | GET | `/api/sync-state` | Watermarks & PO cursor state |
-| Dashboard | GET | `/api/dashboard/stats` | Summary statistics |
-
-See [`API_REFERENCE.md`](API_REFERENCE.md) for full request/response documentation.
-
-The React frontend consumes these APIs to display database metadata, records, connector info, and to trigger extractions.
+**Resolution Applied**:
+1. **Per-Supplier Cursors (`supplier_po_cursor`)**: Replaced the monolithic watermark with independent tracking for each supplier's `(date, purchase_order)`.
+2. **Resumable Batch Checkpoints**: POs are committed in configurable batches (`PO_BATCH=500`).
+3. **Strict Keyset Paging**: Predicates use `(F gt V) or (F eq V and Key gt 'k')` to guarantee forward progression even when timestamps collide.

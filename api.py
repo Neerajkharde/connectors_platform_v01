@@ -44,7 +44,15 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -497,6 +505,7 @@ def health_check():
 
     return {
         "status": "healthy" if db_ok else "degraded",
+        "backend": "online",
         "database": {
             "connected": db_ok,
             "error": db_error,
@@ -725,6 +734,45 @@ def get_table_records(
 # 4. ENTITIES  (matches the existing frontend contract)
 # ===================================================================
 
+def _get_fallback_fields(entity: str) -> list[dict]:
+    """Introspect dataclass models when PostgreSQL is offline or tables not yet created."""
+    model_cls = TABLE_MODELS.get(entity)
+    if not model_cls:
+        return []
+    pk_cols = TABLE_PKS.get(entity, [])
+    fk_map = TABLE_FKS.get(entity, {})
+    desc_map = FIELD_DESCRIPTIONS.get(entity, {})
+    fields_list = []
+    for f in dc_fields(model_cls):
+        t_str = str(f.type)
+        if "str" in t_str:
+            display_type = "VARCHAR"
+        elif "int" in t_str:
+            display_type = "INTEGER"
+        elif "Decimal" in t_str:
+            display_type = "DECIMAL(15,2)"
+        elif "bool" in t_str:
+            display_type = "BOOLEAN"
+        elif "datetime" in t_str:
+            display_type = "TIMESTAMPTZ"
+        elif "date" in t_str:
+            display_type = "DATE"
+        else:
+            display_type = "TEXT"
+
+        nullable = "Optional" in t_str or f.name not in pk_cols
+
+        fields_list.append({
+            "name": f.name,
+            "type": display_type,
+            "nullable": nullable,
+            "primary_key": f.name in pk_cols,
+            "foreign_key": fk_map.get(f.name),
+            "description": desc_map.get(f.name, ""),
+        })
+    return fields_list
+
+
 @app.get("/api/entities", tags=["Entities"])
 def list_entities():
     """List database entities (tables) — compatible with existing frontend."""
@@ -746,8 +794,18 @@ def list_entities():
                         "description": TABLE_DESCRIPTIONS.get(name, ""),
                         "record_count": count,
                     })
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    except Exception:
+        # Graceful fallback: return entity list even if DB is offline or not yet initialized
+        entities = [
+            {
+                "name": name,
+                "entity": name,
+                "label": TABLE_LABELS.get(name, name),
+                "description": TABLE_DESCRIPTIONS.get(name, ""),
+                "record_count": 0,
+            }
+            for name in TABLE_NAMES
+        ]
     return {"entities": entities}
 
 
@@ -775,7 +833,11 @@ def get_entity_fields(entity: str):
                     """,
                     (entity,),
                 )
-                for row in cur.fetchall():
+                rows = cur.fetchall()
+                if not rows:
+                    return {"entity": entity, "fields": _get_fallback_fields(entity)}
+
+                for row in rows:
                     col_name = row[0]
                     data_type = row[1]
                     max_len = row[2]
@@ -802,8 +864,9 @@ def get_entity_fields(entity: str):
                         "foreign_key": fk_map.get(col_name),
                         "description": desc_map.get(col_name, ""),
                     })
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    except Exception:
+        # Fall back to dataclass model introspection if DB is offline
+        return {"entity": entity, "fields": _get_fallback_fields(entity)}
 
     return {"entity": entity, "fields": fields_list}
 
@@ -821,13 +884,21 @@ def get_entity_records(
     try:
         with _db() as conn:
             with conn.cursor() as cur:
+                # Check if table exists
+                cur.execute(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = %s)",
+                    (entity,),
+                )
+                if not cur.fetchone()[0]:
+                    return {"entity": entity, "records": []}
+
                 pk_cols = TABLE_PKS.get(entity, [])
                 order = " ORDER BY " + ", ".join(pk_cols) if pk_cols else ""
                 cur.execute(f"SELECT * FROM {entity}{order} LIMIT %s OFFSET %s", (limit, offset))
                 records = [_row_to_dict(cur, row) for row in cur.fetchall()]
                 return {"entity": entity, "records": records}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    except Exception:
+        return {"entity": entity, "records": []}
 
 
 # ===================================================================
