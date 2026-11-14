@@ -1,0 +1,189 @@
+TERMINAL LOG:
+PS V:\sap-postgres-connector-staged> python -m app.main
+
+============================================================
+  Step 1 - Loading configuration
+============================================================
+  SAP base URL : https://sandbox.api.sap.com/s4hanacloud
+  SAP auth mode: apikey
+  PostgreSQL   : postgres@localhost:5432/sap_connector
+  Paging/limits: page=50, filter-chunk=20, expand=True, delay=0.25s
+  Mode         : incremental
+
+============================================================
+  Step 2 - Connecting to SAP and PostgreSQL
+============================================================
+  OK SAP HTTP client ready
+  OK PostgreSQL connection established
+  OK Run id: 752e469b-6436-43fd-96c3-7ca8d31e3ee0
+
+============================================================
+  Stage 1 - Suppliers
+============================================================
+  Watermark (CreationDate): 2019-08-19 00:00:00
+  Fetched 800 suppliers, 903 company, 325 purchasing-org, 0 text records
+  (SAP calls so far: 16)
+  OK all rows are consistent with the foreign keys
+  -> supplier                 : 676 new, 0 updated, 124 unchanged
+  -> supplier_company         : 767 new, 0 updated, 136 unchanged
+  -> supplier_purchasing_org  : 200 new, 0 updated, 125 unchanged
+  -> supplier_text            : 0 new, 0 updated, 0 unchanged
+  Supplier watermark -> 2023-02-06 00:00:00 / 1000473
+  OK Stage 1 committed
+
+============================================================
+  Stage 2 - Purchase orders, items & invoices (resumable batches)
+============================================================
+  1501 suppliers in the database (1501 never synced for POs), 76 supplier chunk(s)
+  Budget this run: up to 5000 POs, in batches of 500
+
+  Batch 1: 0 POs, 0 items, 0 invoice headers, 0 references (SAP calls so far: 17)
+  OK all rows are consistent with the foreign keys
+  -> purchase_order           : 0 new, 0 updated, 0 unchanged
+  -> purchase_order_item      : 0 new, 0 updated, 0 unchanged
+  -> supplier_invoice         : 0 new, 0 updated, 0 unchanged
+  -> invoice_po_reference     : 0 new, 0 updated, 0 unchanged
+
+  Batch 2: 8 POs, 7 items, 0 invoice headers, 0 references (SAP calls so far: 20)
+  OK all rows are consistent with the foreign keys
+  -> purchase_order           : 0 new, 0 updated, 8 unchanged
+  -> purchase_order_item      : 0 new, 0 updated, 7 unchanged
+  -> supplier_invoice         : 0 new, 0 updated, 0 unchanged
+  -> invoice_po_reference     : 0 new, 0 updated, 0 unchanged
+
+  Batch 3: 0 POs, 0 items, 0 invoice headers, 0 references (SAP calls so far: 21)
+  OK all rows are consistent with the foreign keys
+  -> purchase_order           : 0 new, 0 updated, 0 unchanged
+  -> purchase_order_item      : 0 new, 0 updated, 0 unchanged
+  -> supplier_invoice         : 0 new, 0 updated, 0 unchanged
+  -> invoice_po_reference     : 0 new, 0 updated, 0 unchanged
+
+  Batch 4: 0 POs, 0 items, 0 invoice headers, 0 references (SAP calls so far: 22)
+  OK all rows are consistent with the foreign keys
+  -> purchase_order           : 0 new, 0 updated, 0 unchanged
+  -> purchase_order_item      : 0 new, 0 updated, 0 unchanged
+  -> supplier_invoice         : 0 new, 0 updated, 0 unchanged
+  -> invoice_po_reference     : 0 new, 0 updated, 0 unchanged
+
+  Batch 5: 0 POs, 0 items, 0 invoice headers, 0 references (SAP calls so far: 23)
+  OK all rows are consistent with the foreign keys
+  -> purchase_order           : 0 new, 0 updated, 0 unchanged
+  -> purchase_order_item      : 0 new, 0 updated, 0 unchanged
+  -> supplier_invoice         : 0 new, 0 updated, 0 unchanged
+  -> invoice_po_reference     : 0 new, 0 updated, 0 unchanged
+
+  Batch 6: 2 POs, 2 items, 1 invoice headers, 1 references (SAP calls so far: 27)
+  OK all rows are consistent with the foreign keys
+  -> purchase_order           : 0 new, 0 updated, 2 unchanged
+  -> purchase_order_item      : 0 new, 0 updated, 2 unchanged
+  -> supplier_invoice         : 0 new, 0 updated, 1 unchanged
+  -> invoice_po_reference     : 0 new, 0 updated, 1 unchanged
+
+  Batch 7: 500 POs, 561 items, 10 invoice headers, 19 references (SAP calls so far: 88)
+  OK all rows are consistent with the foreign keys
+  -> purchase_order           : 0 new, 0 updated, 500 unchanged
+  -> purchase_order_item      : 0 new, 0 updated, 561 unchanged
+  -> supplier_invoice         : 0 new, 0 updated, 10 unchanged
+  -> invoice_po_reference     : 0 new, 0 updated, 19 unchanged
+
+  Batch 8: 500 POs, 500 items, 0 invoice headers, 0 references (SAP calls so far: 148)
+  OK all rows are consistent with the foreign keys
+  -> purchase_order           : 0 new, 0 updated, 500 unchanged
+  -> purchase_order_item      : 0 new, 0 updated, 500 unchanged
+  -> supplier_invoice         : 0 new, 0 updated, 0 unchanged
+  -> invoice_po_reference     : 0 new, 0 updated, 0 unchanged
+
+  Batch 9: 500 POs, 500 items, 0 invoice headers, 0 references (SAP calls so far: 208)
+  OK all rows are consistent with the foreign keys
+  -> purchase_order           : 0 new, 0 updated, 500 unchanged
+  -> purchase_order_item      : 0 new, 0 updated, 500 unchanged
+  -> supplier_invoice         : 0 new, 0 updated, 0 unchanged
+  -> invoice_po_reference     : 0 new, 0 updated, 0 unchanged
+
+  Batch 10: 246 POs, 246 items, 0 invoice headers, 0 references (SAP calls so far: 239)
+  OK all rows are consistent with the foreign keys
+  -> purchase_order           : 0 new, 0 updated, 246 unchanged
+  -> purchase_order_item      : 0 new, 0 updated, 246 unchanged
+  -> supplier_invoice         : 0 new, 0 updated, 0 unchanged
+  -> invoice_po_reference     : 0 new, 0 updated, 0 unchanged
+
+  Batch 11: 19 POs, 19 items, 0 invoice headers, 0 references (SAP calls so far: 242)
+  OK all rows are consistent with the foreign keys
+  -> purchase_order           : 0 new, 0 updated, 19 unchanged
+  -> purchase_order_item      : 0 new, 0 updated, 19 unchanged
+  -> supplier_invoice         : 0 new, 0 updated, 0 unchanged
+  -> invoice_po_reference     : 0 new, 0 updated, 0 unchanged
+
+  Batch 12: 44 POs, 46 items, 7 invoice headers, 7 references (SAP calls so far: 250)
+  OK all rows are consistent with the foreign keys
+  -> purchase_order           : 0 new, 0 updated, 44 unchanged
+  -> purchase_order_item      : 0 new, 0 updated, 46 unchanged
+  -> supplier_invoice         : 0 new, 0 updated, 7 unchanged
+  -> invoice_po_reference     : 0 new, 0 updated, 7 unchanged
+
+  Batch 13: 0 POs, 0 items, 0 invoice headers, 0 references (SAP calls so far: 251)
+  OK all rows are consistent with the foreign keys
+  -> purchase_order           : 0 new, 0 updated, 0 unchanged
+  -> purchase_order_item      : 0 new, 0 updated, 0 unchanged
+  -> supplier_invoice         : 0 new, 0 updated, 0 unchanged
+  -> invoice_po_reference     : 0 new, 0 updated, 0 unchanged
+
+  Batch 14: 0 POs, 0 items, 0 invoice headers, 0 references (SAP calls so far: 252)
+  OK all rows are consistent with the foreign keys
+  -> purchase_order           : 0 new, 0 updated, 0 unchanged
+  -> purchase_order_item      : 0 new, 0 updated, 0 unchanged
+  -> supplier_invoice         : 0 new, 0 updated, 0 unchanged
+  -> invoice_po_reference     : 0 new, 0 updated, 0 unchanged
+
+  Batch 15: 500 POs, 542 items, 49 invoice headers, 51 references (SAP calls so far: 318)
+  OK all rows are consistent with the foreign keys
+  -> purchase_order           : 327 new, 0 updated, 173 unchanged
+  -> purchase_order_item      : 337 new, 0 updated, 205 unchanged
+  -> supplier_invoice         : 20 new, 0 updated, 29 unchanged
+  -> invoice_po_reference     : 21 new, 0 updated, 30 unchanged
+
+  Batch 16: 500 POs, 496 items, 16 invoice headers, 16 references (SAP calls so far: 380)
+  OK all rows are consistent with the foreign keys
+  -> purchase_order           : 500 new, 0 updated, 0 unchanged
+  -> purchase_order_item      : 496 new, 0 updated, 0 unchanged
+  -> supplier_invoice         : 16 new, 0 updated, 0 unchanged
+  -> invoice_po_reference     : 16 new, 0 updated, 0 unchanged
+
+------------------------------------------------------------
+  [DIAG] HTTP 500  GET  https://sandbox.api.sap.com/s4hanacloud/sap/opu/odata/sap/API_SUPPLIERINVOICE_PROCESS_SRV/A_SupplierInvoice?%24filter=%28SupplierInvoice+eq+%275101974999%27+and+FiscalYear+eq+%272023%27%29+or+%28SupplierInvoice+eq+%275101975585%27+and+FiscalYear+eq+%272023%27%29+or+%28SupplierInvoice+eq+%275101975589%27+and+FiscalYear+eq+%272023%27%29+or+%28SupplierInvoice+eq+%275101975590%27+and+FiscalYear+eq+%272023%27%29+or+%28SupplierInvoice+eq+%275101975591%27+and+FiscalYear+eq+%272023%27%29+or+%28SupplierInvoice+eq+%275101976692%27+and+FiscalYear+eq+%272023%27%29+or+%28SupplierInvoice+eq+%275101976696%27+and+FiscalYear+eq+%272023%27%29+or+%28SupplierInvoice+eq+%275101976697%27+and+FiscalYear+eq+%272023%27%29+or+%28SupplierInvoice+eq+%275101976698%27+and+FiscalYear+eq+%272023%27%29+or+%28SupplierInvoice+eq+%275101977626%27+and+FiscalYear+eq+%272023%27%29&%24top=50
+  [DIAG] Request headers : {'User-Agent': 'python-requests/2.32.5', 'Accept-Encoding': 'gzip, deflate', 'Accept': 'application/atom+xml', 'Connection': 'keep-alive', 'APIKey': '***redacted***', 'Cookie': '***redacted***'}
+  [DIAG] Response headers: {'Date': 'Tue, 03 Nov 2026 11:41:38 GMT', 'Content-Type': 'application/json', 'Content-Length': '183', 'Connection': 'keep-alive'}
+  [DIAG] Response body   :
+{"fault":{"faultstring":"Rate limit quota violation. Quota limit  exceeded. Identifier : ***redacted***","detail":{"errorcode":"policies.ratelimit.QuotaViolation"}}}
+------------------------------------------------------------
+
+
+[QUOTA] SAP API quota exceeded (policies.ratelimit.QuotaViolation). Retrying does not help - wait for the quota window to reset or use a different API key.
+        Every stage that finished before the quota error is already saved
+        (see run_log). Re-run after the quota resets - it continues from the watermarks.
+
+
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Nothing is broken. This is the quota safety behaviour working as designed, and your progress is saved.
+
+What happened
+Batch 16 was saved. The 500 new lines print right before the commit, and no SAP call happens between them.
+The quota ran out during batch 17, on the A_SupplierInvoice call. The run stopped immediately and sent no more requests.
+Only batch 17 was lost. It wasn’t saved and its cursor didn’t move, so the next run redoes it. That costs about 22 SAP calls (380 calls / 16 batches ≈ 24 per batch).
+All 16 earlier batches (about 8,000 POs) are in the database.
+
+What to do now
+Don’t re-run yet. Every retry burns calls, and the error itself says retrying doesn’t help. Wait for the quota window to reset. I don’t know your key’s window (hourly, daily, etc.). Your SAP API Business Hub account page should show it.
+
+Check the state first if you want to confirm:
+sql
+   SELECT started_at, status, sap_calls FROM run_log ORDER BY started_at DESC LIMIT 3;   -- latest should say QUOTA
+   SELECT count(*) FROM supplier_po_cursor;   -- grows with each batch
+   SELECT count(*) FROM supplier;             -- target to reach
+   SELECT count(*) FROM purchase_order;
+
+After the reset, run python -m app.main again. It continues from the saved cursors. Repeat each time the quota resets until the log no longer says PO_TOP reached - N supplier(s) still to be scanned.

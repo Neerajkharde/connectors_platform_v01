@@ -20,7 +20,7 @@ of invoice keys*, both paged - instead of one call per PO and per invoice.
 import requests
 
 from app.odata import chunked, entry_properties, iter_v2_entries, parse_feed, quote, or_filter
-from app.sap_client import SAPClient
+from app.sap_client import SAPClient, SAPQuotaExceeded
 
 INVOICE_SRV = "/sap/opu/odata/sap/API_SUPPLIERINVOICE_PROCESS_SRV"
 INV_HEADER_PATH = f"{INVOICE_SRV}/A_SupplierInvoice"
@@ -71,22 +71,26 @@ def fetch_invoice_headers(
 ) -> list[dict]:
     """Fetch invoice headers for (SupplierInvoice, FiscalYear) keys."""
     headers: list[dict] = []
-    for chunk in chunked(sorted(keys), chunk_size):
-        if len(headers) >= top:
-            break
-        flt = " or ".join(
-            f"(SupplierInvoice eq {quote(inv)} and FiscalYear eq {quote(fy)})" for inv, fy in chunk
-        )
-        try:
-            for entry in iter_v2_entries(client, INV_HEADER_PATH, {"$filter": flt}, page_size, top - len(headers)):
-                headers.append(entry_properties(entry))
-        except requests.HTTPError as exc:
-            # Combined filter rejected -> fall back to one call per key for this chunk only
-            print(f"  [WARN] Combined invoice filter failed ({exc}); fetching {len(chunk)} headers one by one.")
-            for inv, fy in chunk:
-                hdr = fetch_invoice_header(client, inv, fy)
-                if hdr:
-                    headers.append(hdr)
+    try:
+        for chunk in chunked(sorted(keys), chunk_size):
+            if len(headers) >= top:
+                break
+            flt = " or ".join(
+                f"(SupplierInvoice eq {quote(inv)} and FiscalYear eq {quote(fy)})" for inv, fy in chunk
+            )
+            try:
+                for entry in iter_v2_entries(client, INV_HEADER_PATH, {"$filter": flt}, page_size, top - len(headers)):
+                    headers.append(entry_properties(entry))
+            except requests.HTTPError as exc:
+                # Combined filter rejected -> fall back to one call per key for this chunk only
+                print(f"  [WARN] Combined invoice filter failed ({exc}); fetching {len(chunk)} headers one by one.")
+                for inv, fy in chunk:
+                    hdr = fetch_invoice_header(client, inv, fy)
+                    if hdr:
+                        headers.append(hdr)
+    except SAPQuotaExceeded as exc:
+        exc.partial = headers  # headers fetched before the quota ran out
+        raise
     return headers
 
 
@@ -109,5 +113,11 @@ def fetch_all_invoices_and_refs(
         for r in refs
         if r.get("SupplierInvoice") and r.get("FiscalYear")
     }
-    headers = fetch_invoice_headers(client, keys, top, page_size, max(1, chunk_size // 2))
+    try:
+        headers = fetch_invoice_headers(client, keys, top, page_size, max(1, chunk_size // 2))
+    except SAPQuotaExceeded as exc:
+        # the references are complete, only some headers are missing; the
+        # integrity step drops references whose header is not in the DB yet.
+        exc.partial = {"invoice_headers": exc.partial, "po_refs": refs}
+        raise
     return {"invoice_headers": headers, "po_refs": refs}
