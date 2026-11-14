@@ -420,3 +420,89 @@ Because the cap was hit, the code deliberately did not save a PO watermark. It w
 3. **Run again.** Each run moves forward by up to `PO_TOP` POs and `SUPPLIER_TOP` suppliers (about 170 SAP calls at `PO_TOP=2000`).
    When the "still to be scanned" line disappears you are caught up; from then on runs download almost nothing.
 4. If you see `SAP rejected the ... date filter`, see Troubleshooting.
+
+
+## Web Dashboard (React)
+
+The project includes a React-based web dashboard that provides a user interface for interacting with the SAP S/4HANA to PostgreSQL connector.
+
+### Architecture
+
+```text
+React Frontend (Vite)
+        |
+        | HTTP Requests
+        v
+FastAPI Backend
+        |
+        v
+Python Connector Modules
+        |
+        v
+SAP S/4HANA APIs
+
+FastAPI Backend
+        |
+        v
+PostgreSQL Database
+```
+
+### Frontend Features
+
+- **Dashboard:** View available SAP data entities and explore their fields.
+- **Entity Selection:** Select database entities and fields to inspect.
+- **Data Preview:** Preview records retrieved from PostgreSQL.
+- **Data Export:** Download selected data as CSV.
+- **Backend Integration:** Communicate with the FastAPI backend through REST APIs.
+
+### Technology Stack
+
+| Component | Technology |
+|---|---|
+| Frontend | React.js |
+| Frontend Tooling | Vite |
+| Backend API | FastAPI |
+| Database | PostgreSQL |
+| Data Extraction | Python |
+| Source APIs | SAP S/4HANA OData |
+
+### Running the Web Application
+
+**1. Start the FastAPI backend**
+
+From the project root:
+
+```bash
+uvicorn api:app --reload
+```
+
+The backend runs at:
+
+`http://127.0.0.1:8000`
+
+API documentation is available at:
+
+`http://127.0.0.1:8000/docs`
+
+**2. Start the React frontend**
+
+Open another terminal:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open the local URL displayed by Vite in your browser.
+
+**3. Backend API Endpoints**
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/api/health` | Check backend health |
+| GET | `/api/entities` | Retrieve available entities |
+| GET | `/api/entities/{entity}/fields` | Retrieve entity field metadata |
+| GET | `/api/entities/{entity}/records` | Retrieve records from PostgreSQL |
+
+The React frontend consumes these APIs to display database metadata and records.
