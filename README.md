@@ -167,9 +167,11 @@ sap-postgres-connector/
 │   │   └── mappers.py            # SAP field → PostgreSQL column mappers
 │   └── repositories/
 │       └── repositories.py       # upsert logic (insert / update-if-changed) for all 8 tables
+├── api.py                        # FastAPI backend — 19 REST endpoints for the web dashboard
 ├── sql/
 │   ├── schema.sql                # PostgreSQL DDL (8 data tables; drops data + cursor tables)
 │   └── incremental.sql           # sync_state, supplier_po_cursor, run_log, change_log + triggers (auto-applied)
+├── frontend/                     # React (Vite) web dashboard
 ├── tests/
 │   ├── test_mappers.py           # Unit tests for mapping functions
 │   ├── test_odata.py             # OData parsing, paging, $filter helpers
@@ -179,6 +181,7 @@ sap-postgres-connector/
 │   ├── test_incremental_units.py # keyset filters, connectors, integrity with DB keys (no DB)
 │   └── test_incremental_e2e.py   # full run vs. fake SAP + real PostgreSQL
 ├── diag_test.py                  # endpoint diagnostic (1 call per probe)
+├── API_REFERENCE.md              # Full REST API documentation (19 endpoints)
 ├── .env.example
 ├── .gitignore
 ├── requirements.txt
@@ -498,11 +501,30 @@ Open the local URL displayed by Vite in your browser.
 
 **3. Backend API Endpoints**
 
-| Method | Endpoint | Purpose |
-|---|---|---|
-| GET | `/api/health` | Check backend health |
-| GET | `/api/entities` | Retrieve available entities |
-| GET | `/api/entities/{entity}/fields` | Retrieve entity field metadata |
-| GET | `/api/entities/{entity}/records` | Retrieve records from PostgreSQL |
+The backend exposes 19 REST endpoints grouped by feature area:
 
-The React frontend consumes these APIs to display database metadata and records.
+| Group | Method | Endpoint | Purpose |
+|---|---|---|---|
+| Health | GET | `/api/health` | Backend + database health check |
+| Connectors | GET | `/api/connectors` | List all SAP connectors with metadata |
+| Connectors | GET | `/api/connectors/{id}` | Single connector detail |
+| Tables | GET | `/api/tables` | List 8 DB tables with record counts |
+| Tables | GET | `/api/tables/{name}/schema` | Full schema: columns, types, PKs, FKs, descriptions |
+| Tables | GET | `/api/tables/{name}/records` | Paginated records with search & sort |
+| Entities | GET | `/api/entities` | List entities (frontend compat) |
+| Entities | GET | `/api/entities/{entity}/fields` | Entity field metadata |
+| Entities | GET | `/api/entities/{entity}/records` | Entity records |
+| SAP Entities | GET | `/api/sap-entities` | SAP entities with mandatory / optional fields |
+| SAP Entities | GET | `/api/sap-entities/{id}` | SAP entity detail + enriched field list |
+| Extraction | POST | `/api/extract` | Trigger data extraction |
+| Extraction | GET | `/api/extract/{id}` | Check extraction status |
+| Extraction | GET | `/api/extractions` | List all extractions (session) |
+| History | GET | `/api/history/runs` | Extraction run log |
+| History | GET | `/api/history/runs/{run_id}` | Run detail + change count |
+| History | GET | `/api/history/changes` | Change log entries (filterable) |
+| Sync | GET | `/api/sync-state` | Watermarks & PO cursor state |
+| Dashboard | GET | `/api/dashboard/stats` | Summary statistics |
+
+See [`API_REFERENCE.md`](API_REFERENCE.md) for full request/response documentation.
+
+The React frontend consumes these APIs to display database metadata, records, connector info, and to trigger extractions.
